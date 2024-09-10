@@ -1,7 +1,7 @@
 import os
 
-from triton.runtime.cache import (FileCacheManager, default_cache_dir,
-                                  default_dump_dir, default_override_dir)
+#from triton.runtime.cache import (FileCacheManager, default_cache_dir,
+#                                  default_dump_dir, default_override_dir)
 
 from vllm.logger import init_logger
 
