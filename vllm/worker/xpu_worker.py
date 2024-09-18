@@ -182,6 +182,7 @@ class XPUWorker(LoraNotSupportedWorkerBase, Worker):
             # use sockets as default Level zero IPC exchange backend. By
             # default oneccl will use `drmfd` as mechanism which need extra
             # dependency (libdrm and drm headers) on your system.
+            '''
             ENV_CCL_ZE_IPC_EXCHANGE = os.getenv("CCL_ZE_IPC_EXCHANGE",
                                                 "sockets")
             ENV_LOCAL_WORLD_SIZE = os.getenv("LOCAL_WORLD_SIZE",
@@ -189,6 +190,12 @@ class XPUWorker(LoraNotSupportedWorkerBase, Worker):
             os.environ['CCL_ZE_IPC_EXCHANGE'] = ENV_CCL_ZE_IPC_EXCHANGE
             os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
             os.environ["LOCAL_RANK"] = str(self.local_rank)
+            '''
+            os.environ['CCL_ZE_IPC_EXCHANGE'] = 'drmfd'
+            os.environ["LOCAL_WORLD_SIZE"] = '4'
+            os.environ["LOCAL_RANK"] = str(self.local_rank)
+            os.environ["CCL_ATL_TRANSPORT"] = 'ofi'
+            os.environ["FI_PROVIDER"] = 'cxi'
             init_distributed_environment(
                 world_size=parallel_config.world_size,
                 rank=rank,

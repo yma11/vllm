@@ -210,7 +210,7 @@ def _wait_until_pg_removed(current_placement_group: "PlacementGroup"):
 
 def initialize_ray_cluster(
     parallel_config: ParallelConfig,
-    ray_address: Optional[str] = None,
+    ray_address: Optional[str] = '10.168.4.9:6379',
 ):
     """Initialize the distributed cluster with Ray.
 
@@ -229,7 +229,7 @@ def initialize_ray_cluster(
     if is_hip() or is_xpu():
         ray.init(address=ray_address,
                  ignore_reinit_error=True,
-                 num_gpus=parallel_config.world_size)
+                 num_gpus=None)
     else:
         ray.init(address=ray_address, ignore_reinit_error=True)
 
