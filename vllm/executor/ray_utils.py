@@ -215,7 +215,7 @@ def _wait_until_pg_removed(current_placement_group: "PlacementGroup"):
 
 def initialize_ray_cluster(
     parallel_config: ParallelConfig,
-    ray_address: Optional[str] = None
+    ray_address: Optional[str] = None,
 ):
     """Initialize the distributed cluster with Ray.
 
@@ -235,8 +235,8 @@ def initialize_ray_cluster(
         try:
             ray.init('auto')
         except ray.exceptions.ConnectionError:
-            logger.warning("No existing RAY instance detected. " +
-                           "A new instance will be launched with current node resources.")
+            logger.warning("No existing RAY instance detected. A new instance " +
+                           "will be launched with current node resources.")
             ray.init(address=ray_address,
                      ignore_reinit_error=True,
                      num_gpus=parallel_config.world_size)
