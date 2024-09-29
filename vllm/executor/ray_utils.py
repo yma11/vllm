@@ -234,9 +234,11 @@ def initialize_ray_cluster(
         # Try to connect existing ray instance and create a new one if not found
         try:
             ray.init('auto')
-        except ray.exceptions.ConnectionError:
-            logger.warning('''No existing RAY instance detected. A new instance
-                will be launched with current node resources.''')
+        except ConnectionError:
+            logger.warning(
+                "No existing RAY instance detected. A new instance"
+                " will be launched with gpu number: %d.",
+                num_gpus=parallel_config.world_size)
             ray.init(address=ray_address,
                      ignore_reinit_error=True,
                      num_gpus=parallel_config.world_size)
