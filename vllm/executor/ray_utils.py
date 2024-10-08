@@ -238,7 +238,7 @@ def initialize_ray_cluster(
             logger.warning(
                 "No existing RAY instance detected. A new instance"
                 " will be launched with gpu number: %d.",
-                num_gpus=parallel_config.world_size)
+                parallel_config.world_size)
             ray.init(address=ray_address,
                      ignore_reinit_error=True,
                      num_gpus=parallel_config.world_size)
