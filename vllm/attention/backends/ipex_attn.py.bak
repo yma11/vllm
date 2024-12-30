@@ -9,11 +9,13 @@ import torch
 
 from vllm._ipex_ops import ipex_ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
-                                              AttentionMetadataBuilder, AttentionType)
+                                              AttentionMetadataBuilder,
+                                              AttentionMetadata, AttentionType)
 from vllm.multimodal import MultiModalPlaceholderMap
-from vllm.attention.ops.paged_attn import PagedAttention
+from vllm.attention.ops.paged_attn import (PagedAttention,
+                                           PagedAttentionMetadata)
 from vllm.attention.backends.utils import (
-    CommonAttentionState, compute_slot_mapping,
+    PAD_SLOT_ID, CommonAttentionState, compute_slot_mapping,
     compute_slot_mapping_start_idx, is_block_tables_empty)
 from vllm.utils import async_tensor_h2d, make_tensor_with_pad
 from vllm.attention.backends.flash_attn import FlashAttentionMetadata
@@ -74,20 +76,47 @@ class IpexAttnBackend(AttentionBackend):
 
 
 @dataclass
-class IpexAttnMetadata(FlashAttentionMetadata):
-    def advance_step(self,
-                     model_input: "ModelInputForGPUWithSamplingMetadata",
-                     sampled_token_ids: Optional[torch.Tensor],
-                     block_size: int,
-                     num_seqs: int,
-                     num_queries: int,
-                     turn_prefills_into_decodes: bool = False):
-        raise NotImplementedError
+class IpexAttnMetadata(AttentionMetadata, PagedAttentionMetadata):
+    """Metadata for IpexAttnBackend.
+    """
+    # Currently, input sequences can only contain all prompts
+    # or all decoding. True if all sequences are prompts.
+    is_prompt: bool
+    slot_mapping: torch.Tensor
+    seq_lens: Optional[List[int]]
+    seqlen_q: Optional[torch.Tensor]
+    max_seqlen: Optional[int]
+
+    def __post_init__(self):
+        # Set during the execution of the first attention op.
+        # It is a list because it is needed to set per prompt
+        # when alibi slopes is used. It is because of the limitation
+        # from xformer API.
+        # will not appear in the __repr__ and __init__
+        self.attn_bias: Optional[List[torch.Tensor]] = None
+
+    @property
+    def prefill_metadata(self) -> Optional["IpexAttnMetadata"]:
+        # Currently chunked prefill is not supported
+        if self.num_decode_tokens == 0:
+            assert self.num_prefills > 0
+            return self
+
+        return None
+
+    @property
+    def decode_metadata(self) -> Optional["IpexAttnMetadata"]:
+        # Currently chunked prefill is not supported
+        if self.num_prefills > 0:
+            assert self.num_decode_tokens == 0
+            return None
+
+        return self
 
 class IpexAttnMetadataBuilder(
     AttentionMetadataBuilder[IpexAttnMetadata]):
 
-    def __init__(self, input_builder: "ModelInputForXPUBuilder"):
+    def __init__(self, input_builder: "ModelInputForGPUBuilder"):
         self.slot_mapping: List[int] = []
         self.prefill_seq_lens: List[int] = []
         self.context_lens: List[int] = []
@@ -107,7 +136,7 @@ class IpexAttnMetadataBuilder(
         self.block_size = input_builder.block_size
 
     def _add_seq_group(
-            self, inter_data: "ModelInputForXPUBuilder.InterDataForSeqGroup",
+            self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
             chunked_prefill_enabled: bool, prefix_cache_hit: bool):
         """Add a sequence group to the metadata. Specifically update/append
         1. context length.
@@ -165,6 +194,30 @@ class IpexAttnMetadataBuilder(
             compute_slot_mapping(is_profile_run, self.slot_mapping, seq_id,
                                  seq_len, context_len, start_idx,
                                  self.block_size, inter_data.block_tables)
+
+    def _get_graph_runner_block_tables(
+            self, num_seqs: int,
+            block_tables: List[List[int]]) -> torch.Tensor:
+        # The shape of graph_block_tables is
+        # [max batch size, max context len // block size].
+        max_batch_size, max_blocks = self.runner.graph_block_tables.shape
+        assert max_batch_size >= num_seqs
+
+        graph_block_tables = self.runner.graph_block_tables[:num_seqs]
+        for i, block_table in enumerate(block_tables):
+            if block_table:
+                num_blocks = len(block_table)
+                if num_blocks <= max_blocks:
+                    graph_block_tables[i, :num_blocks] = block_table
+                else:
+                    # It may be possible to have more blocks allocated due
+                    # to lookahead slots of multi-step, however, they are
+                    # not used anyway, so can be safely ignored.
+                    graph_block_tables[
+                    i, :max_blocks] = block_table[:max_blocks]
+
+        return torch.from_numpy(graph_block_tables).to(
+            device=self.runner.device, non_blocking=True)
 
     def build(self, seq_lens: List[int], query_lens: List[int],
               cuda_graph_pad_size: int, batch_size: int):
@@ -258,7 +311,6 @@ class IpexAttnBackendImpl(AttentionImpl[IpexAttnMetadata]):
         kv_cache_dtype: str,
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
-        attn_type: str = AttentionType.DECODER,
     ) -> None:
         if blocksparse_params is not None:
             raise ValueError(
@@ -290,11 +342,6 @@ class IpexAttnBackendImpl(AttentionImpl[IpexAttnMetadata]):
             raise NotImplementedError(
                 "IPEX backend does not support FP8 KV cache. "
                 "Please use xFormers backend instead.")
-        if attn_type != AttentionType.DECODER:
-            raise NotImplementedError("Encoder self-attention and "
-                                      "encoder/decoder cross-attention "
-                                      "are not implemented for "
-                                      "IpexAttnBackendImpl")
 
     def split_kv_cache(
         self,
@@ -321,6 +368,7 @@ class IpexAttnBackendImpl(AttentionImpl[IpexAttnMetadata]):
         attn_metadata: IpexAttnMetadata,  # type: ignore
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        attn_type: str = AttentionType.DECODER,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with IPEX varlen_attention and PagedAttention.
@@ -336,91 +384,199 @@ class IpexAttnBackendImpl(AttentionImpl[IpexAttnMetadata]):
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
-        # NOTE(woosuk): IPEXAttention does not support FP8 KV cache.
-        assert k_scale == 1.0 and v_scale == 1.0, (
-            "key/v_scale is not supported in IPEXAttention.")
+        assert k_scale == 1.0 and v_scale == 1.0
+        if attn_type != AttentionType.DECODER:
+            raise NotImplementedError("Encoder self-attention and "
+                                      "encoder/decoder cross-attention "
+                                      "are not implemented for "
+                                      "IpexAttnBackendImpl")
+        num_tokens, hidden_size = query.shape
+        # Reshape the query, key, and value tensors.
+        query = query.view(-1, self.num_heads, self.head_size)
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size)
 
-        output = torch.empty_like(query)
-        torch.ops.vllm.ipex_attn_chunked_prefill(
-            output,
-            query,
-            key,
-            value,
-            attn_metadata,
-            self.num_heads,
-            self.head_size,
-            self.num_kv_heads,
-            kv_cache,
-            self.kv_cache_dtype,
-            k_scale,
-            v_scale,
-            self.scale,
-            self.sliding_window,
-            self.alibi_slopes,
-            self.logits_soft_cap,
-        )
+        if kv_cache.numel() > 0:
+            key_cache, value_cache = self.split_kv_cache(
+                kv_cache, self.num_kv_heads, self.head_size)
+            ipex_ops.reshape_and_cache(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                attn_metadata.slot_mapping.flatten(),
+                self.kv_cache_dtype,
+                k_scale,
+                v_scale,
+            )
+
+        if attn_metadata.is_prompt:
+            assert attn_metadata.seq_lens is not None
+            if (kv_cache.numel() == 0
+                    or attn_metadata.block_tables.numel() == 0):
+                if self.num_kv_heads != self.num_heads:
+                    key = key.repeat_interleave(self.num_queries_per_kv, dim=1)
+                    value = value.repeat_interleave(self.num_queries_per_kv,
+                                                    dim=1)
+
+                if attn_metadata.attn_bias is None:
+                    if self.alibi_slopes is not None:
+                        att_masks = _make_alibi_bias(
+                            self.alibi_slopes, query.dtype,
+                            attn_metadata.seq_lens)  # type: ignore
+                    elif self.sliding_window is not None:
+                        att_masks = _make_sliding_window_bias(
+                            attn_metadata.seq_lens, self.sliding_window,
+                            query.dtype)  # type: ignore
+                    else:
+                        att_masks = _make_sliding_window_bias(
+                            attn_metadata.seq_lens, None, dtype=query.dtype)
+                    attn_metadata.attn_bias = att_masks
+
+                output = torch.empty(
+                    (num_tokens, self.num_heads, self.head_size),
+                    dtype=query.dtype,
+                    device=query.device)
+                ipex_ops.varlen_attention(
+                    query,
+                    key,
+                    value,
+                    output,
+                    attn_metadata.seqlen_q,
+                    attn_metadata.seqlen_q,
+                    attn_metadata.max_seqlen,
+                    attn_metadata.max_seqlen,
+                    pdropout=0.0,
+                    softmax_scale=self.scale,
+                    zero_tensors=False,
+                    is_causal=True,
+                    return_softmax=False,
+                    gen_=None,
+                    logits_soft_cap=self.logits_soft_cap,
+                )
+            else:
+                # prefix-enabled attention
+                raise RuntimeError(
+                    "IPEX backend doesn't support prefix decoding.")
+
+        else:
+            # Decoding run.
+            max_seq_len = attn_metadata.max_decode_seq_len
+            output = torch.empty_like(query)
+            block_size = value_cache.shape[3]
+            num_seqs, num_heads, head_size = query.shape
+            max_num_partitions = ((max_seq_len + _PARTITION_SIZE - 1) //
+                                  _PARTITION_SIZE)
+            # NOTE(woosuk): We use a simple heuristic to decide whether to use
+            # PagedAttention V1 or V2. If the number of partitions is 1, we use
+            # V1 to avoid the overhead of reduction. Also, if the number of
+            # sequences or heads is large, we use V1 since there is enough work
+            # to parallelize.
+            # TODO(woosuk): Tune this heuristic.
+            # For context len > 8192, use V2 kernel to avoid shared memory
+            # shortage.
+            use_v1 = (max_seq_len <= 8192 and
+                      (max_num_partitions == 1 or num_seqs * num_heads > 512))
+            if use_v1:
+                # Run PagedAttention V1.
+                ipex_ops.paged_attention_v1(
+                    output,
+                    query,
+                    key_cache,
+                    value_cache,
+                    self.num_kv_heads,
+                    self.scale,
+                    attn_metadata.block_tables,
+                    attn_metadata.seq_lens_tensor,
+                    block_size,
+                    max_seq_len,
+                    self.alibi_slopes,
+                    self.kv_cache_dtype,
+                    k_scale,
+                    v_scale,
+                )
+            else:
+                # Run PagedAttention V2.
+                assert _PARTITION_SIZE % block_size == 0
+                tmp_output = torch.empty(
+                    size=(num_seqs, num_heads, max_num_partitions, head_size),
+                    dtype=output.dtype,
+                    device=output.device,
+                )
+                exp_sums = torch.empty(
+                    size=(num_seqs, num_heads, max_num_partitions),
+                    dtype=torch.float32,
+                    device=output.device,
+                )
+                max_logits = torch.empty_like(exp_sums)
+                ipex_ops.paged_attention_v2(
+                    output,
+                    exp_sums,
+                    max_logits,
+                    tmp_output,
+                    query,
+                    key_cache,
+                    value_cache,
+                    self.num_kv_heads,
+                    self.scale,
+                    attn_metadata.block_tables,
+                    attn_metadata.seq_lens_tensor,
+                    block_size,
+                    max_seq_len,
+                    self.alibi_slopes,
+                    self.kv_cache_dtype,
+                    k_scale,
+                    v_scale,
+                )
+
+            # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
 
-    @torch.library.custom_op("vllm::ipex_attn_chunked_prefill",
-                             mutates_args=["output", "kv_cache"])
-    def ipex_attn_chunked_prefill(
-        output: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: IpexAttnMetadata,
-        num_heads: int,
-        head_size: int,
-        num_kv_heads: int,
-        kv_cache: torch.Tensor,
-        kv_cache_dtype: str,
-        k_scale: float,
-        v_scale: float,
-        scale: float,
-        sliding_window: Optional[List[int]] = None,
-        alibi_slopes: Optional[torch.Tensor] = None,
-        logits_soft_cap: Optional[float] = None,
-    ) -> None:
-        if attn_metadata is None:
-            # Profiling run.
-            return
-        num_actual_tokens = attn_metadata.num_actual_tokens
 
-        query = query.view(-1, num_heads, head_size)
-        key = key.view(-1, num_kv_heads, head_size)
-        value = value.view(-1, num_kv_heads, head_size)
+def _make_alibi_bias(
+    alibi_slopes: torch.Tensor,
+    dtype: torch.dtype,
+    seq_lens: List[int],
+) -> List[torch.Tensor]:
+    attn_biases = []
+    for seq_len in seq_lens:
+        bias = torch.arange(seq_len, dtype=dtype, device=alibi_slopes.device)
+        # NOTE(zhuohan): HF uses
+        #     `bias = bias[None, :].repeat(seq_len, 1)`
+        # here. We find that both biases give the same results, but
+        # the bias below more accurately follows the original ALiBi
+        # paper.
+        bias = bias[None, :] - bias[:, None]
 
-        # Reshape the input keys and values and store them in the cache.
-        key_cache = kv_cache[0]
-        value_cache = kv_cache[1]
+        num_heads = alibi_slopes.shape[0]
+        bias = bias[None, :].repeat((num_heads, 1, 1))
+        bias.mul_(alibi_slopes[:, None, None])
+        inf_mask = torch.empty(
+            (1, seq_len, seq_len),
+            dtype=bias.dtype,
+            device=alibi_slopes.device).fill_(-torch.inf).triu_(diagonal=1)
+        attn_biases.append((bias + inf_mask).to(dtype))
 
-        ipex_ops.reshape_and_cache_flash(
-            key[:num_actual_tokens],
-            value[:num_actual_tokens],
-            key_cache,
-            value_cache,
-            attn_metadata.slot_mapping,
-            kv_cache_dtype,
-            k_scale,
-            v_scale,
+    return attn_biases
+
+
+def _make_sliding_window_bias(
+    seq_lens: List[int],
+    window_size: Optional[int],
+    dtype: torch.dtype,
+) -> List[torch.Tensor]:
+    attn_biases = []
+    for seq_len in seq_lens:
+        tensor = torch.full(
+            (1, seq_len, seq_len),
+            dtype=dtype,
+            fill_value=1,
         )
+        shift = 0
+        mask = torch.tril(tensor, diagonal=shift).to(dtype)  # type: ignore
+        if window_size is not None:
+            mask = torch.triu(mask, diagonal=shift - window_size + 1)
+        mask = torch.log(mask)
+        attn_biases.append(mask.to(dtype))
 
-        ipex_ops.chunked_prefill(
-            query[:num_actual_tokens],
-            key_cache,
-            value_cache,
-            output[:num_actual_tokens],
-            attn_metadata.query_start_loc,
-            attn_metadata.seq_start_loc,
-            None,
-            attn_metadata.block_table,
-            alibi_slopes,
-            attn_metadata.max_query_len,
-            attn_metadata.max_seq_len,
-            0.0,
-            scale,
-            False,
-            True,
-            False,
-            None,
-        )
+    return attn_biases
