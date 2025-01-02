@@ -290,6 +290,77 @@ class IpexAttnBackendImpl(AttentionImpl[IpexAttnMetadata]):
                 "IPEX backend does not support FP8 KV cache. "
                 "Please use xFormers backend instead.")
 
+    def ipex_attn_chunked_prefill(
+        self,
+        output: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: IpexAttnMetadata,
+        num_heads: int,
+        head_size: int,
+        num_kv_heads: int,
+        kv_cache: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: float,
+        v_scale: float,
+        scale: float,
+        sliding_window: Optional[List[int]] = None,
+        alibi_slopes: Optional[torch.Tensor] = None,
+        logits_soft_cap: Optional[float] = None,
+    ) -> None:
+        print(attn_metadata)
+        if attn_metadata is None:
+            # Profiling run.
+            return
+        num_actual_tokens = attn_metadata.num_prefill_tokens + attn_metadata.num_decode_tokens
+        query = query.view(-1, num_heads, head_size)
+        key = key.view(-1, num_kv_heads, head_size)
+        value = value.view(-1, num_kv_heads, head_size)
+        print("!!!!!!kav")
+        print(kv_cache)
+        key_cache = None
+        value_cache = None
+        if kv_cache.numel() > 0:
+            print("!!!!!!!kv_cache.numel() > 0")
+            key_cache, value_cache = self.split_kv_cache(
+                kv_cache, self.num_kv_heads, self.head_size)
+            ipex_ops.reshape_and_cache(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                attn_metadata.slot_mapping.flatten(),
+                self.kv_cache_dtype,
+                k_scale,
+                v_scale,
+            )
+        if (kv_cache.numel() == 0 or attn_metadata.block_tables is None
+                or attn_metadata.block_tables.numel() == 0):
+            key_cache = key[:attn_metadata.num_prefill_tokens]
+            value_cache = value[:attn_metadata.num_prefill_tokens]
+        max_seq_len = max(attn_metadata.seq_lens)
+        ipex_ops.chunked_prefill(
+            query[:num_actual_tokens],
+            key_cache,
+            value_cache,
+            output[:num_actual_tokens],
+            attn_metadata.query_start_loc,
+            attn_metadata.seq_start_loc,
+            None,
+            attn_metadata.block_tables,
+            alibi_slopes,
+            attn_metadata.max_query_len,
+            max_seq_len,
+            0.0,
+            scale,
+            False,
+            True,
+            False,
+            None,
+        )
+
+
     def split_kv_cache(
         self,
         kv_cache: torch.Tensor,
@@ -336,7 +407,10 @@ class IpexAttnBackendImpl(AttentionImpl[IpexAttnMetadata]):
             "key/v_scale is not supported in IPEXAttention.")
 
         output = torch.empty_like(query)
-        torch.ops.vllm.ipex_attn_chunked_prefill(
+        print("!!!!!!!key query")
+        print(key)
+        print(query)
+        self.ipex_attn_chunked_prefill(
             output,
             query,
             key,
@@ -355,9 +429,7 @@ class IpexAttnBackendImpl(AttentionImpl[IpexAttnMetadata]):
             self.logits_soft_cap,
         )
         return output.view(-1, self.num_heads * self.head_size)
-
-    @torch.library.custom_op("vllm::ipex_attn_chunked_prefill",
-                             mutates_args=["output", "kv_cache"])
+    '''
     def ipex_attn_chunked_prefill(
         output: torch.Tensor,
         query: torch.Tensor,
@@ -419,3 +491,4 @@ class IpexAttnBackendImpl(AttentionImpl[IpexAttnMetadata]):
             False,
             None,
         )
+        '''

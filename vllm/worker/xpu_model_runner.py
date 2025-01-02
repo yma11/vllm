@@ -28,7 +28,7 @@ from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
 
 from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
-from vllm.utils import DeviceMemoryProfiler, PyObjectCache, flatten_2d_lists, async_tensor_h2d
+from vllm.utils import DeviceMemoryProfiler, PyObjectCache, flatten_2d_lists, async_tensor_h2d, is_pin_memory_available
 from vllm.worker.model_runner import AttentionMetadata, SamplingMetadata
 from vllm.worker.model_runner_base import (
     ModelRunnerBase, ModelRunnerInputBase, ModelRunnerInputBuilderBase,
@@ -788,10 +788,14 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
         # if cuda_graph_pad_size:
         #     input_tokens.extend(itertools.repeat(0, cuda_graph_pad_size))
         assert self.runner.device is not None
-        input_tokens_tensor = input_tokens
+        input_tokens_tensor = async_tensor_h2d(input_tokens, torch.long,
+                                               self.runner.device,
+                                               self.runner.pin_memory)
 
-        token_types_tensor = token_types if token_types else None
-
+        token_types_tensor = async_tensor_h2d(token_types, torch.long,
+                                               self.runner.device,
+                                               self.runner.pin_memory) \
+                                                if token_types else None
         if mrope_input_positions is not None:
             for idx in range(3):
                 mrope_input_positions[idx].extend(
@@ -905,6 +909,7 @@ class XPUModelRunner(ModelRunnerBase[ModelInputForXPUWithSamplingMetadata]):
         self.return_hidden_states = return_hidden_states
 
         self.device = self.device_config.device
+        self.pin_memory = is_pin_memory_available()
 
         self.kv_cache_dtype = kv_cache_dtype
         self.sliding_window = model_config.get_sliding_window()
@@ -927,6 +932,9 @@ class XPUModelRunner(ModelRunnerBase[ModelInputForXPUWithSamplingMetadata]):
 
         # Lazy initialization.
         self.model: nn.Module  # Set after init_Model
+
+        # Used to cache python objects
+        self.inter_data_cache: Dict[int, PyObjectCache] = {}
 
         self.sampling_metadata_cache: SamplingMetadataCache = \
               SamplingMetadataCache() \
@@ -1041,7 +1049,7 @@ class XPUModelRunner(ModelRunnerBase[ModelInputForXPUWithSamplingMetadata]):
         builder = self._builder_cls(weakref.proxy(self), finished_requests_ids)
         for seq_group_metadata in seq_group_metadata_list:
             builder.add_seq_group(seq_group_metadata)
-
+        builder.reset_cached_inter_data()
         return builder.build()  # type: ignore
 
     def prepare_model_input(
@@ -1066,9 +1074,11 @@ class XPUModelRunner(ModelRunnerBase[ModelInputForXPUWithSamplingMetadata]):
             pin_memory=False,
             generators=generators,
             cache=self.sampling_metadata_cache)
-
+        is_prompt = (seq_group_metadata_list[0].is_prompt
+             if seq_group_metadata_list else None)
         return dataclasses.replace(model_input,
                                    sampling_metadata=sampling_metadata,
+                                   is_prompt=is_prompt,
                                    virtual_engine=virtual_engine)
 
     @torch.inference_mode()
