@@ -702,7 +702,6 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
             reinit=True,
             reinit_use_defaults=True,
             encoder_seq_len=encoder_seq_len)
-
         self.inter_data_list.append(inter_data)
 
         for seq_idx in range(n_seqs):
