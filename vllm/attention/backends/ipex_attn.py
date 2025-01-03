@@ -14,7 +14,7 @@ from vllm.multimodal import MultiModalPlaceholderMap
 from vllm.attention.ops.paged_attn import PagedAttention
 from vllm.attention.backends.utils import (
     CommonAttentionState, compute_slot_mapping,
-    compute_slot_mapping_start_idx, is_block_tables_empty)
+    compute_slot_mapping_start_idx, is_block_tables_empty, get_num_prefill_decode_query_kv_tokens)
 from vllm.utils import async_tensor_h2d, make_tensor_with_pad
 from vllm.attention.backends.flash_attn import FlashAttentionMetadata
 
@@ -50,8 +50,9 @@ class IpexAttnBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
     ) -> Tuple[int, ...]:
-        return PagedAttention.get_kv_cache_shape(num_blocks, block_size,
-                                                 num_kv_heads, head_size)
+        if block_size % 16 != 0:
+            raise ValueError("Block size must be a multiple of 16.")
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def swap_blocks(
@@ -147,9 +148,11 @@ class IpexAttnMetadataBuilder(
             if prefix_cache_hit:
                 # NOTE(woosuk): For flash-attn, the block table should
                 # include the entries for the incoming prefill tokens.
+                print("!!!!!!!prefix cache hit")
                 block_table = block_tables[seq_id]
             elif ((chunked_prefill_enabled or not is_prompt)
                   and block_tables is not None):
+                print("!!!!! chunked prefill enabled")
                 if curr_sliding_window_block == 0:
                     block_table = block_tables[seq_id]
                 else:
@@ -290,77 +293,6 @@ class IpexAttnBackendImpl(AttentionImpl[IpexAttnMetadata]):
                 "IPEX backend does not support FP8 KV cache. "
                 "Please use xFormers backend instead.")
 
-    def ipex_attn_chunked_prefill(
-        self,
-        output: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: IpexAttnMetadata,
-        num_heads: int,
-        head_size: int,
-        num_kv_heads: int,
-        kv_cache: torch.Tensor,
-        kv_cache_dtype: str,
-        k_scale: float,
-        v_scale: float,
-        scale: float,
-        sliding_window: Optional[List[int]] = None,
-        alibi_slopes: Optional[torch.Tensor] = None,
-        logits_soft_cap: Optional[float] = None,
-    ) -> None:
-        print(attn_metadata)
-        if attn_metadata is None:
-            # Profiling run.
-            return
-        num_actual_tokens = attn_metadata.num_prefill_tokens + attn_metadata.num_decode_tokens
-        query = query.view(-1, num_heads, head_size)
-        key = key.view(-1, num_kv_heads, head_size)
-        value = value.view(-1, num_kv_heads, head_size)
-        print("!!!!!!kav")
-        print(kv_cache)
-        key_cache = None
-        value_cache = None
-        if kv_cache.numel() > 0:
-            print("!!!!!!!kv_cache.numel() > 0")
-            key_cache, value_cache = self.split_kv_cache(
-                kv_cache, self.num_kv_heads, self.head_size)
-            ipex_ops.reshape_and_cache(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping.flatten(),
-                self.kv_cache_dtype,
-                k_scale,
-                v_scale,
-            )
-        if (kv_cache.numel() == 0 or attn_metadata.block_tables is None
-                or attn_metadata.block_tables.numel() == 0):
-            key_cache = key[:attn_metadata.num_prefill_tokens]
-            value_cache = value[:attn_metadata.num_prefill_tokens]
-        max_seq_len = max(attn_metadata.seq_lens)
-        ipex_ops.chunked_prefill(
-            query[:num_actual_tokens],
-            key_cache,
-            value_cache,
-            output[:num_actual_tokens],
-            attn_metadata.query_start_loc,
-            attn_metadata.seq_start_loc,
-            None,
-            attn_metadata.block_tables,
-            alibi_slopes,
-            attn_metadata.max_query_len,
-            max_seq_len,
-            0.0,
-            scale,
-            False,
-            True,
-            False,
-            None,
-        )
-
-
     def split_kv_cache(
         self,
         kv_cache: torch.Tensor,
@@ -405,90 +337,273 @@ class IpexAttnBackendImpl(AttentionImpl[IpexAttnMetadata]):
         # NOTE(woosuk): IPEXAttention does not support FP8 KV cache.
         assert k_scale == 1.0 and v_scale == 1.0, (
             "key/v_scale is not supported in IPEXAttention.")
-
+        #assert output is not None, "Output tensor must be provided."
         output = torch.empty_like(query)
-        print("!!!!!!!key query")
-        print(key)
-        print(query)
-        self.ipex_attn_chunked_prefill(
-            output,
-            query,
-            key,
-            value,
-            attn_metadata,
-            self.num_heads,
-            self.head_size,
-            self.num_kv_heads,
-            kv_cache,
-            self.kv_cache_dtype,
-            k_scale,
-            v_scale,
-            self.scale,
-            self.sliding_window,
-            self.alibi_slopes,
-            self.logits_soft_cap,
-        )
-        return output.view(-1, self.num_heads * self.head_size)
-    '''
-    def ipex_attn_chunked_prefill(
-        output: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: IpexAttnMetadata,
-        num_heads: int,
-        head_size: int,
-        num_kv_heads: int,
-        kv_cache: torch.Tensor,
-        kv_cache_dtype: str,
-        k_scale: float,
-        v_scale: float,
-        scale: float,
-        sliding_window: Optional[List[int]] = None,
-        alibi_slopes: Optional[torch.Tensor] = None,
-        logits_soft_cap: Optional[float] = None,
-    ) -> None:
-        if attn_metadata is None:
-            # Profiling run.
-            return
-        num_actual_tokens = attn_metadata.num_actual_tokens
+        if (attn_type == AttentionType.ENCODER
+                and (not attn_metadata.is_all_encoder_attn_metadata_set)):
+            raise AttributeError("Encoder attention requires setting "
+                                 "encoder metadata attributes.")
+        elif (attn_type == AttentionType.ENCODER_DECODER
+              and (not attn_metadata.is_all_cross_attn_metadata_set)):
+            raise AttributeError("Encoder/decoder cross-attention "
+                                 "requires setting cross-attention "
+                                 "metadata attributes.")
 
-        query = query.view(-1, num_heads, head_size)
-        key = key.view(-1, num_kv_heads, head_size)
-        value = value.view(-1, num_kv_heads, head_size)
+        kv_cache_dtype: str = self.kv_cache_dtype
+        softmax_scale: float = self.scale
+        window_size = self.sliding_window
+        alibi_slopes: Optional[torch.Tensor] = self.alibi_slopes
+        logits_soft_cap: Optional[float] = self.logits_soft_cap
+        query = query.view(-1, self.num_heads, self.head_size)
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size)
+        if kv_cache.numel() > 0:
+            # We skip updating the KV cache under two conditions:
+            #  a. When the Attention Type is ENCODER. In this phase, we compute
+            #     only the encoder attention without updating the cache.
+            #  b. When both Key and Value are None. This occurs during
+            #     cross-attention computation in the decoding phase, where the
+            #     KV cache is already populated with the cross-attention
+            #     tensor. Thus, we skip cache updates during this time.
+            if (attn_type != AttentionType.ENCODER) and (key is not None) and (
+                    value is not None):
+                if attn_type == AttentionType.ENCODER_DECODER:
+                    # Update cross-attention KV cache (prefill-only)
+                    updated_slot_mapping = attn_metadata.cross_slot_mapping
+                else:
+                    # Update self-attention KV cache (prefill/decode)
+                    updated_slot_mapping = attn_metadata.slot_mapping
+                key_cache = kv_cache[0]
+                value_cache = kv_cache[1]
+                #key_cache, value_cache = self.split_kv_cache(
+                 #       kv_cache, self.num_kv_heads, self.head_size)
+                # Reshape the input keys and values and store them in the cache.
+                # If kv_cache is not provided, the new key and value tensors are
+                # not cached. This happens during the initial memory
+                # profiling run.
+                ipex_ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    updated_slot_mapping.flatten(),  # type: ignore[union-attr]
+                    kv_cache_dtype,
+                    k_scale,
+                    v_scale,
+                )
+        else :
+            return output
+        (num_prefill_query_tokens, num_prefill_kv_tokens,
+         num_decode_query_tokens) = \
+            get_num_prefill_decode_query_kv_tokens(attn_metadata, attn_type)
+        decode_query = query[num_prefill_query_tokens:]
+        decode_output = output[num_prefill_query_tokens:]
+        # QKV for prefill.
+        query = query[:num_prefill_query_tokens]
+        prefill_output = output[:num_prefill_query_tokens]
+        assert query.shape[0] == num_prefill_query_tokens
+        assert decode_query.shape[0] == num_decode_query_tokens
 
-        # Reshape the input keys and values and store them in the cache.
-        key_cache = kv_cache[0]
-        value_cache = kv_cache[1]
+        if prefill_meta := attn_metadata.prefill_metadata:
+            # Prompt run.
+            if (kv_cache.numel() == 0 or prefill_meta.block_tables is None
+                    or prefill_meta.block_tables.numel() == 0):
+                # normal attention
+                # When block_tables are not filled, it means q and k are the
+                # prompt, and they have the same length.
+                q_seq_start_loc, q_seq_len, k_seq_start_loc, k_seq_len = \
+                    _get_query_key_seq_metadata(prefill_meta, True, attn_type)
+                key = key[:num_prefill_kv_tokens]
+                value = value[:num_prefill_kv_tokens]
+                print("!!!!!!calling prefill")
+                ipex_ops.chunked_prefill(
+                    query=query,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    #key_cache=key,
+                    #value_cache=value,
+                    cu_seqlens_q=q_seq_start_loc,
+                    cu_seqlens_k=k_seq_start_loc,
+                    max_seqlen_q=q_seq_len,
+                    max_seqlen_k=k_seq_len,
+                    softmax_scale=softmax_scale,
+                    is_casual=_get_causal_option(attn_type),
+                    # window_size=window_size,
+                    alibi_slopes=alibi_slopes,
+                    # softcap=logits_soft_cap,
+                    output=prefill_output,
+                    block_table=prefill_meta.block_tables,
+                    #block_table=None,
+                    seq_used_k=None,
+                    p_dropout=0.0,
+                    zero_tensors=False,
+                    return_softmax=False,
+                    gen_=None,
+                )
+            else:
+                # prefix-enabled attention
+                print("!!!!!!!!calling prefix-enabled attention")
+                assert attn_type == AttentionType.DECODER, (
+                    "Only decoder-only models support prefix caching")
+                assert prefill_meta.seq_lens is not None
+                max_seq_len = max(prefill_meta.seq_lens)
+                ipex_ops.chunked_prefill(  # noqa
+                    query=query,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    cu_seqlens_q=prefill_meta.query_start_loc,
+                    max_seqlen_q=prefill_meta.max_query_len,
+                    cu_seqlens_k=prefill_meta.seq_start_loc,
+                    max_seqlen_k=max_seq_len,
+                    softmax_scale=softmax_scale,
+                    is_casual=True,
+                    # window_size=window_size,
+                    alibi_slopes=alibi_slopes,
+                    block_table=prefill_meta.block_tables,
+                    # softcap=logits_soft_cap,
+                    output=prefill_output,
+                    seq_used_k=None,
+                    p_dropout=0.0,
+                    zero_tensors=False,
+                    return_softmax=False,
+                    gen_=None,
+                )
 
-        ipex_ops.reshape_and_cache_flash(
-            key[:num_actual_tokens],
-            value[:num_actual_tokens],
-            key_cache,
-            value_cache,
-            attn_metadata.slot_mapping,
-            kv_cache_dtype,
-            k_scale,
-            v_scale,
-        )
+        if decode_meta := attn_metadata.decode_metadata:
+            # Decoding run.
+            # Use flash_attn_varlen_func kernel for speculative decoding
+            # because different queries might have different lengths.
+            print("!!!!!!calling decode!!!!")
+            assert decode_meta.max_decode_query_len is not None
+            # use only for actual varlen decoding
+            # if decode_meta.max_decode_query_len > 1:
+            assert attn_type == AttentionType.DECODER, (
+                "Only decoder-only models support max_decode_query_len > 1"
+            )
+            ipex_ops.chunked_prefill(
+                query=decode_query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                cu_seqlens_q=decode_meta.query_start_loc,
+                max_seqlen_q=decode_meta.max_decode_query_len,
+                cu_seqlens_k=decode_meta.seq_start_loc,
+                max_seqlen_k=decode_meta.max_decode_seq_len,
+                softmax_scale=softmax_scale,
+                is_casual=True,
+                # window_size=window_size,
+                alibi_slopes=alibi_slopes,
+                # softcap=logits_soft_cap,
+                block_table=decode_meta.block_tables,
+                output=decode_output,
+                seq_used_k=None,
+                p_dropout=0.0,
+                zero_tensors=False,
+                return_softmax=False,
+                gen_=None,
+            )
+            '''
+            else:
+                # Use flash_attn_with_kvcache for normal decoding.
+                (
+                    seq_lens_arg,
+                    _,
+                    block_tables_arg,
+                ) = get_seq_len_block_table_args(decode_meta, False, attn_type)
+                flash_attn_with_kvcache(
+                    q=decode_query.unsqueeze(1),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    block_table=block_tables_arg,
+                    cache_seqlens=seq_lens_arg,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    window_size=window_size,
+                    alibi_slopes=alibi_slopes,
+                    softcap=logits_soft_cap,
+                    out=decode_output.unsqueeze(1),
+                )
+            '''
+        return output
 
-        ipex_ops.chunked_prefill(
-            query[:num_actual_tokens],
-            key_cache,
-            value_cache,
-            output[:num_actual_tokens],
-            attn_metadata.query_start_loc,
-            attn_metadata.seq_start_loc,
-            None,
-            attn_metadata.block_table,
-            alibi_slopes,
-            attn_metadata.max_query_len,
-            attn_metadata.max_seq_len,
-            0.0,
-            scale,
-            False,
-            True,
-            False,
-            None,
-        )
-        '''
+
+def _get_query_key_seq_metadata(
+        attn_metadata,
+        is_prompt: bool,
+        attn_type: str,
+) -> tuple:
+    """
+    Returns sequence metadata for key and query based on the specified
+    attention type and whether input is a prompt.
+
+    This function computes the starting locations and maximum sequence lengths
+    for key and query sequences for different attention types.
+
+    Args:
+        attn_metadata: The attention metadata object
+        is_prompt (bool): A flag indicating if the input is a prompt
+        attn_type (AttentionType): The type of attention being used.
+
+    Returns:
+        tuple: A tuple containing four integers:
+            - Starting location for the query sequence.
+            - Maximum sequence length for the query sequence.
+            - Starting location for the key sequence.
+            - Maximum sequence length for the key sequence.
+
+    Raises:
+        AttributeError: If an invalid attention type is provided.
+    """
+    if attn_type == AttentionType.DECODER:
+        # Decoder self-attention
+        # Choose max_seq_len based on whether we are in prompt_run
+        if is_prompt:
+            max_seq_len = attn_metadata.max_prefill_seq_len
+        else:
+            max_seq_len = attn_metadata.max_decode_seq_len
+        return (attn_metadata.seq_start_loc, max_seq_len,
+                attn_metadata.seq_start_loc, max_seq_len)
+
+    elif attn_type == AttentionType.ENCODER_DECODER:
+        # This is cross attention between the where the key
+        # is the precomputed encoder attention and query
+        # is the input sequence.
+        # Choose query max length based on whether it is prompt
+        # or not.
+        if is_prompt:
+            max_seq_len = attn_metadata.max_prefill_seq_len
+        else:
+            max_seq_len = attn_metadata.max_decode_seq_len
+        return (attn_metadata.seq_start_loc, max_seq_len,
+                attn_metadata.encoder_seq_start_loc,
+                attn_metadata.max_encoder_seq_len)
+    elif attn_type == AttentionType.ENCODER:
+        # For encoder attention both the query and the key are same i.e the
+        # encoder sequence.
+        return (attn_metadata.encoder_seq_start_loc,
+                attn_metadata.max_encoder_seq_len,
+                attn_metadata.encoder_seq_start_loc,
+                attn_metadata.max_encoder_seq_len)
+    elif attn_type == AttentionType.ENCODER_ONLY:
+        assert is_prompt, "Should not have decode for encoder only model."
+        return (attn_metadata.seq_start_loc, attn_metadata.max_prefill_seq_len,
+                attn_metadata.seq_start_loc, attn_metadata.max_prefill_seq_len)
+    else:
+        raise AttributeError(f"Invalid attention type {str(attn_type)}")
+
+
+def _get_causal_option(attn_type: str) -> bool:
+    """
+    Determine whether the given attention type is suitable for causal
+    attention mechanisms.
+
+    Args:
+        attn_type (AttentionType): The type of attention being evaluated
+
+    Returns:
+        bool: Returns `True` if the attention type is suitable for causal
+        attention (i.e., not encoder, encoder-only, or encoder-decoder),
+        otherwise returns `False`.
+    """
+    return not (attn_type == AttentionType.ENCODER
+                or attn_type == AttentionType.ENCODER_ONLY
+                or attn_type == AttentionType.ENCODER_DECODER)
