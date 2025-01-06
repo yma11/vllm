@@ -893,7 +893,6 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
             prompt_adapter_mapping=prompt_adapter_mapping,
             prompt_adapter_requests=prompt_adapter_requests)
 
-
 class XPUModelRunner(ModelRunnerBase[ModelInputForXPUWithSamplingMetadata]):
     _model_input_cls: Type[ModelInputForXPUWithSamplingMetadata] = (
         ModelInputForXPUWithSamplingMetadata)
@@ -956,7 +955,7 @@ class XPUModelRunner(ModelRunnerBase[ModelInputForXPUWithSamplingMetadata]):
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB",
                     self.model_memory_usage / float(2**30))
-        
+
         if self.lora_config:
             assert supports_lora(self.model), "Model does not support LoRA"
             assert not supports_multimodal(
