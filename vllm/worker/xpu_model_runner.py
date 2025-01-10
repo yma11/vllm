@@ -404,13 +404,13 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
         self.per_seq_compute_fns = [
             self._compute_lens,
             self._compute_for_prefix_cache_hit,
-            # self._compute_for_sliding_window,
-            # self._compute_lora_input,
+            self._compute_for_sliding_window,
+            self._compute_lora_input,
         ]
         # Compute functions for each sequence group.
         # WARNING: The order of the functions matters!
         self.per_seq_group_compute_fns = [
-            # self._compute_prompt_adapter_input,
+            self._compute_prompt_adapter_input,
             # self._compute_multi_modal_input,
         ]
 
@@ -600,33 +600,33 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
         else:
             inter_data.lora_prompt_mapping.append([])
 
-    # def _compute_prompt_adapter_input(
-    #         self, inter_data: InterDataForSeqGroup,
-    #         seq_group_metadata: SequenceGroupMetadata):
-    #     """If prompt adapter is enabled, compute index and prompt mapping.
-    #     """
-    #     # Note that when is_prompt=True, we expect only one sequence
-    #     # in the group.
-    #     if not self.enable_prompt_adapter:
-    #         return
-    #
-    #     prompt_adapter_id = seq_group_metadata.prompt_adapter_id
-    #     if prompt_adapter_id <= 0 or not inter_data.is_prompt:
-    #         return
-    #
-    #     # We expect only one sequence in the group when is_prompt=True.
-    #     assert inter_data.n_seqs == 1
-    #     query_len = inter_data.query_lens[0]
-    #     inter_data.prompt_adapter_request = (
-    #         seq_group_metadata.prompt_adapter_request)
-    #
-    #     num_tokens = seq_group_metadata.prompt_adapter_num_virtual_tokens
-    #     inter_data.prompt_adapter_index_mapping = [
-    #                                                   prompt_adapter_id
-    #                                               ] * num_tokens + [0] * (query_len - num_tokens)
-    #     inter_data.prompt_adapter_prompt_mapping = [prompt_adapter_id] * (
-    #         query_len if seq_group_metadata.sampling_params
-    #                      and seq_group_metadata.sampling_params.prompt_logprobs else 1)
+    def _compute_prompt_adapter_input(
+            self, inter_data: InterDataForSeqGroup,
+            seq_group_metadata: SequenceGroupMetadata):
+        """If prompt adapter is enabled, compute index and prompt mapping.
+        """
+        # Note that when is_prompt=True, we expect only one sequence
+        # in the group.
+        if not self.enable_prompt_adapter:
+            return
+
+        prompt_adapter_id = seq_group_metadata.prompt_adapter_id
+        if prompt_adapter_id <= 0 or not inter_data.is_prompt:
+            return
+
+        # We expect only one sequence in the group when is_prompt=True.
+        assert inter_data.n_seqs == 1
+        query_len = inter_data.query_lens[0]
+        inter_data.prompt_adapter_request = (
+            seq_group_metadata.prompt_adapter_request)
+
+        num_tokens = seq_group_metadata.prompt_adapter_num_virtual_tokens
+        inter_data.prompt_adapter_index_mapping = [
+                                                      prompt_adapter_id
+                                                  ] * num_tokens + [0] * (query_len - num_tokens)
+        inter_data.prompt_adapter_prompt_mapping = [prompt_adapter_id] * (
+            query_len if seq_group_metadata.sampling_params
+                         and seq_group_metadata.sampling_params.prompt_logprobs else 1)
 
     # def _compute_multi_modal_input(self, inter_data: InterDataForSeqGroup,
     #                                seq_group_metadata: SequenceGroupMetadata):
@@ -1118,14 +1118,15 @@ class XPUModelRunner(ModelRunnerBase[ModelInputForXPUWithSamplingMetadata]):
             seq_group_metadata_list, finished_requests_ids)
         # Sampling metadata is only required for the final pp group
         generators = self.get_generators(finished_requests_ids)
-        sampling_metadata = SamplingMetadata.prepare(
-            seq_group_metadata_list,
-            model_input.seq_lens,
-            model_input.query_lens,
-            self.device,
-            pin_memory=False,
-            generators=generators,
-            cache=self.sampling_metadata_cache)
+        if get_pp_group().is_last_rank:
+            # Sampling metadata is only required for the final pp group
+            generators = self.get_generators(finished_requests_ids)
+            sampling_metadata = SamplingMetadata.prepare(
+                seq_group_metadata_list, model_input.seq_lens,
+                model_input.query_lens, self.device, self.pin_memory,
+                generators, self.sampling_metadata_cache)
+        else:
+            sampling_metadata = None
         is_prompt = (seq_group_metadata_list[0].is_prompt
              if seq_group_metadata_list else None)
         return dataclasses.replace(model_input,
