@@ -298,7 +298,7 @@ class IpexAttnBackendImpl(AttentionImpl[IpexAttnMetadata]):
                                       "encoder/decoder cross-attention "
                                       "are not implemented for "
                                       "IpexAttnBackendImpl")
-
+        self.attn_type = attn_type
     def split_kv_cache(
         self,
         kv_cache: torch.Tensor,
@@ -344,6 +344,7 @@ class IpexAttnBackendImpl(AttentionImpl[IpexAttnMetadata]):
             "key/v_scale is not supported in IPEXAttention.")
         #assert output is not None, "Output tensor must be provided."
         output = torch.empty_like(query)
+        attn_type = self.attn_type
         if (attn_type == AttentionType.ENCODER
                 and (not attn_metadata.is_all_encoder_attn_metadata_set)):
             raise AttributeError("Encoder attention requires setting "
