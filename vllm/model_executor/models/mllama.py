@@ -32,6 +32,7 @@ from transformers.models.mllama.processing_mllama import (
 
 import vllm.distributed.parallel_state as ps
 from vllm.attention import Attention, AttentionMetadata, AttentionType
+from vllm.attention.ops.hpu_paged_attn import HPUPagedAttention
 from vllm.attention.ops.paged_attn import PagedAttention
 from vllm.attention.selector import _Backend
 from vllm.config import VllmConfig
@@ -54,6 +55,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import SequenceData
 from vllm.utils import is_list_of
+from vllm_hpu_extension.utils import VLLMKVCache
 
 from .clip import CLIPMLP
 from .interfaces import SupportsMultiModal
@@ -834,7 +836,24 @@ class MllamaTextCrossAttention(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         # Skip writing kv-cache for the initial profiling run.
-        if len(kv_cache.shape) > 1:
+        if is_hpu and kv_cache is not None:
+            assert self.attn.backend == _Backend.HPU_ATTN
+            # During cross-attention decode, key & value will be None,
+            # we don't need to cache them.
+            if (k is not None) and (v is not None):
+                key_cache, value_cache = HPUPagedAttention.split_kv_cache(
+                    kv_cache, self.num_local_key_value_heads, self.head_dim)
+                cached_k = torch.cat([k[s:e] for s, e in kv_range_for_decode])
+                cached_v = torch.cat([v[s:e] for s, e in kv_range_for_decode])
+                block_indices = attn_metadata.cross_block_indices
+                block_offsets = attn_metadata.cross_block_offsets
+                k_cache = VLLMKVCache()
+                v_cache = VLLMKVCache()
+                key_cache = k_cache(cached_k, key_cache, block_indices,
+                                         block_offsets)
+                value_cache = v_cache(cached_v, value_cache, block_indices,
+                                           block_offsets)
+        elif len(kv_cache.shape) > 1:
             if self.attn.backend in (_Backend.FLASH_ATTN,
                                      _Backend.FLASH_ATTN_VLLM_V1):
                 cached_k = torch.cat([k[s:e] for s, e in kv_range_for_decode])
@@ -888,14 +907,18 @@ class MllamaTextCrossAttention(nn.Module):
                                               kv_len,
                                               self.head_dim).contiguous()
         attention_mask = attention_mask.view(1, 1, q_len, kv_len)
-        output = F.scaled_dot_product_attention(q,
-                                                k,
-                                                v,
-                                                attn_mask=attention_mask,
-                                                is_causal=False)
-        output = output.permute(2, 0, 1, 3).reshape(
-            q_len, self.num_local_heads * self.head_dim)
-        return output
+        if current_platform.is_hpu():
+            from habana_frameworks.torch.hpex.kernels import FusedSDPA
+            output = FusedSDPA.apply(q, k, v, attention_mask, 0.0)
+            output = output.permute(2, 0, 1, 3).reshape(
+                q_len, self.num_local_heads * self.head_dim)
+            return output
+        else:
+            output = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attention_mask, dropout_p=0.0)
+            output = output.permute(2, 0, 1, 3).reshape(
+                q_len, self.num_local_heads * self.head_dim)
+            return output
 
 
 class MllamaCrossAttentionDecoderLayer(torch.nn.Module):
@@ -1316,7 +1339,12 @@ class MllamaForConditionalGeneration(nn.Module, SupportsMultiModal):
         num_tokens_per_tile: int,
         dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        token_ids = input_ids.tolist()
+        token_ids = []
+        if is_hpu:
+            # input_ids is not flatten yet for hpu
+            token_ids = input_ids.flatten().tolist()
+        else:
+            token_ids = input_ids.tolist()
         start = 0
         batch_token_ids = []
         for seq_len in attn_metadata.seq_lens:
