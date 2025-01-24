@@ -361,7 +361,8 @@ class HPUEncoderDecoderModelRunner(
         # Enable top-k sampling to reflect the accurate memory usage.
         sampling_params = SamplingParams(top_p=0.99, top_k=self.vocab_size - 1)
         max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
-        max_num_seqs = self.scheduler_config.max_num_seqs
+        # Workaround to avoid unexpeced OOM failure during profile run
+        max_num_seqs = int(self.scheduler_config.max_num_seqs/2)
 
         # Profile memory usage with max_num_sequences sequences and the total
         # number of tokens equal to max_num_batched_tokens.
@@ -432,7 +433,8 @@ class HPUEncoderDecoderModelRunner(
             seqs, finished_requests_ids=finished_requests_ids)
         intermediate_tensors = None
         self.execute_model(model_input, kv_caches, intermediate_tensors)
-        torch.cuda.synchronize()
+        torch.hpu.synchronize()
+        gc.collect()
         return
 
     def trim_attn_metadata(self, metadata: AttentionMetadata) -> object:
