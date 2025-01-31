@@ -481,8 +481,10 @@ class HPUEncoderDecoderModelRunner(
             if isinstance(image_data, Image.Image):
                 image_data = [image_data]
             assert is_list_of(image_data, Image.Image)
-            text_prompt_len = input_len - 2 - len(image_data)
-            prompt_token_ids = [128000] + [128256] * len(image_data) + [
+            text_prompt_len = input_len - 1 - len(image_data)
+            # for prompt like '<|image|><|image|><|begin_of_text|>...', token
+            # ids will be '128256 128256 128000 ...'
+            prompt_token_ids =  [128256] * len(image_data) + [
                 128000
             ] + [0] * text_prompt_len
         output_token_ids = [1] * output_len
