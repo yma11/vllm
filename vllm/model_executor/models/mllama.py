@@ -949,21 +949,14 @@ class MllamaTextCrossAttention(nn.Module):
                                               kv_len,
                                               self.head_dim).contiguous()
         attention_mask = attention_mask.view(1, 1, q_len, kv_len)
-        if current_platform.is_hpu():
-            from habana_frameworks.torch.hpex.kernels import FusedSDPA
-            output = FusedSDPA.apply(q, k, v, attention_mask)
-            output = output.permute(2, 0, 1, 3).reshape(
-                q_len, self.num_local_heads * self.head_dim)
-            return output
-        else:
-            output = F.scaled_dot_product_attention(q,
-                                                    k,
-                                                    v,
-                                                    attn_mask=attention_mask,
-                                                    is_causal=False)
-            output = output.permute(2, 0, 1, 3).reshape(
-                q_len, self.num_local_heads * self.head_dim)
-            return output
+        output = F.scaled_dot_product_attention(q,
+                                                k,
+                                                v,
+                                                attn_mask=attention_mask,
+                                                is_causal=False)
+        output = output.permute(2, 0, 1, 3).reshape(
+            q_len, self.num_local_heads * self.head_dim)
+        return output
 
 
 class MllamaCrossAttentionDecoderLayer(torch.nn.Module):
