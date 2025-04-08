@@ -385,6 +385,9 @@ class ipex_ops:
                                               max_seq_length, slice_offset,
                                               slice_size, add_inputs)
 
+    def moe_sum(input: torch.Tensor, output: torch.Tensor):
+       torch.ops.torch_ipex.moe_sum(input, output)
+
     # @staticmethod
     # def lora_expand(inputs: torch.Tensor,
     #                 lora_b_weights: List[torch.Tensor],
