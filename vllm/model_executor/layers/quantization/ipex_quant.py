@@ -220,7 +220,7 @@ class IPEXAutoRoundLinearMethod(LinearMethodBase):
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         weight = layer.weight.data
         scale = layer.weight_scale.data
-        output = torch.ops.torch_ipex.fp8_gemm(x, False, weight, True, None, torch.float16, (torch.ones(1)).xpu(), scale, None, False)
+        output = torch.ops.torch_ipex.fp8_gemm2(x, False, weight, True, None, torch.float16, torch.ones(1, device='xpu'), scale, None, False)
         return output
 
 class IPEXGPTQLinearMethod(GPTQLinearMethod):
