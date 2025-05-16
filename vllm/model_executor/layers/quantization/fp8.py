@@ -169,7 +169,7 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_marlin = (not current_platform.has_device_capability(89)
                            or envs.VLLM_TEST_FORCE_FP8_MARLIN)
         # Disable marlin for rocm
-        if current_platform.is_rocm():
+        if current_platform.is_rocm() or current_platform.is_xpu():
             self.use_marlin = False
 
         self.block_quant = self.quant_config.weight_block_size is not None
@@ -314,8 +314,14 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # If checkpoint not serialized fp8, quantize the weights.
         if not self.quant_config.is_checkpoint_fp8_serialized:
-            qweight, weight_scale = ops.scaled_fp8_quant(layer.weight,
-                                                         scale=None)
+            if current_platform.is_xpu():
+                fp8_dtype = current_platform.fp8_dtype()
+                qweight  = torch.empty(layer.weight.data.shape,device="xpu", dtype=torch.float8_e5m2)
+                weight_scale = torch.zeros(1, device=qweight.device, dtype=torch.float32)
+                torch.ops.torch_ipex.dynamic_scaled_fp8_quant(qweight, layer.weight, weight_scale)
+            else:
+                qweight, weight_scale = ops.scaled_fp8_quant(layer.weight,
+                                                             scale=None)
 
             # If using marlin (w8a16), kernel uses channelwise weights,
             # so extend the weight scales to be channelwise.
@@ -385,6 +391,11 @@ class Fp8LinearMethod(LinearMethodBase):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if current_platform.is_xpu():
+            weight = layer.weight.data.t()
+            scale = layer.weight_scale.data
+            output = torch.ops.torch_ipex.fp8_gemm2(x, False, weight, True, None, torch.bfloat16, torch.ones(1, device='xpu'), scale, None, False)
+            return output
 
         if self.use_marlin:
             return apply_fp8_marlin_linear(
