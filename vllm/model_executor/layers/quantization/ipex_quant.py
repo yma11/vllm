@@ -60,7 +60,7 @@ class IPEXConfig(QuantizationConfig):
         #                      f"but got {self.weight_bits}.")
         #
         if self.method not in ["awq", "gptq", "auto-round", "fp8"]:
-            raise ValueError(f"IPEX quantization supports [awq, gptq], "
+            raise ValueError(f"IPEX quantization supports [awq, gptq, fp8, auto-round], "
                              f"but got {self.method}.")
         if is_checkpoint_fp8_serialized:
             self.quant_method = "fp8"
@@ -220,7 +220,7 @@ class IPEXAutoRoundLinearMethod(LinearMethodBase):
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         weight = layer.weight.data
         scale = layer.weight_scale.data
-        output = torch.ops.torch_ipex.fp8_gemm2(x, False, weight, True, None, torch.float16, torch.ones(1, device='xpu'), scale, None, False)
+        output = torch.ops.torch_ipex.fp8_gemm2(x, False, weight, True, None, x.dtype, torch.ones(1, device='xpu'), scale, bias, False)
         return output
 
 class IPEXGPTQLinearMethod(GPTQLinearMethod):

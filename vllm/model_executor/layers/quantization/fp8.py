@@ -332,7 +332,10 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.logical_widths)
 
             # Update the layer with the new values.
-            layer.weight = Parameter(qweight.t(), requires_grad=False)
+            if current_platform.is_xpu():
+                layer.weight = Parameter(qweight, requires_grad=False)
+            else:
+                layer.weight = Parameter(qweight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             layer.input_scale = None
 
@@ -392,9 +395,9 @@ class Fp8LinearMethod(LinearMethodBase):
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         if current_platform.is_xpu():
-            weight = layer.weight.data.t()
+            weight = layer.weight.data
             scale = layer.weight_scale.data
-            output = torch.ops.torch_ipex.fp8_gemm2(x, False, weight, True, None, torch.bfloat16, torch.ones(1, device='xpu'), scale, None, False)
+            output = torch.ops.torch_ipex.fp8_gemm2(x, False, weight, True, None, x.dtype, torch.ones(1, device='xpu'), scale, bias, False)
             return output
 
         if self.use_marlin:
