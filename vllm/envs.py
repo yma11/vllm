@@ -223,6 +223,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_FLATTEN_LOGPROBS: bool = False
+    VLLM_XPU_FP8_DTYPE: str = "e5m2"
 
 
 def get_default_cache_root():
@@ -1481,6 +1482,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # After enabled, PromptLogprobs and SampleLogprobs would populated as
     # FlattenLogprobs.
     "VLLM_FLATTEN_LOGPROBS": lambda: bool(int(os.getenv("VLLM_FLATTEN_LOGPROBS", "0"))),
+    # fp8 dtype for XPU platform
+    "VLLM_XPU_FP8_DTYPE": lambda: os.environ.get("VLLM_XPU_FP8_DTYPE", "e5m2"),
 }
 
 # --8<-- [end:env-vars-definition]
