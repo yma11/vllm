@@ -316,7 +316,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if not self.quant_config.is_checkpoint_fp8_serialized:
             if current_platform.is_xpu():
                 fp8_dtype = current_platform.fp8_dtype()
-                qweight  = torch.empty(layer.weight.data.shape,device="xpu", dtype=torch.float8_e5m2)
+                qweight  = torch.empty(layer.weight.data.shape,device="xpu", dtype=fp8_dtype)
                 weight_scale = torch.zeros(1, device=qweight.device, dtype=torch.float32)
                 torch.ops.torch_ipex.dynamic_scaled_fp8_quant(qweight, layer.weight, weight_scale)
             else:
