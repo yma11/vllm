@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     VLLM_NIXL_SIDE_CHANNEL_HOST: str = "localhost"
     VLLM_NIXL_SIDE_CHANNEL_PORT: int = 5557
     VLLM_ALL2ALL_BACKEND: str = "naive"
+    VLLM_XPU_FP8_DTYPE: str = "e5m2"
 
 
 def get_default_cache_root():
@@ -814,6 +815,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "pplx": use pplx kernels
     "VLLM_ALL2ALL_BACKEND":
     lambda: os.getenv("VLLM_ALL2ALL_BACKEND", "naive"),
+
+    # fp8 dtype for XPU platform
+    "VLLM_XPU_FP8_DTYPE":
+    lambda: os.environ.get("VLLM_XPU_FP8_DTYPE", "e5m2"),
 }
 
 # --8<-- [end:env-vars-definition]
