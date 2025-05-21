@@ -637,10 +637,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_scale_inv = \
                         dg.get_col_major_tma_aligned_tensor(layer.w2_weight_scale_inv).contiguous()
 
-            return
-
         # If checkpoint is fp16, quantize in place.
-        if not self.quant_config.is_checkpoint_fp8_serialized:
+        elif not self.quant_config.is_checkpoint_fp8_serialized:
             fp8_dtype = current_platform.fp8_dtype()
             w13_weight = torch.empty_like(layer.w13_weight.data,
                                           dtype=fp8_dtype)
@@ -684,7 +682,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                                                       requires_grad=False)
                 layer.w2_weight = torch.nn.Parameter(shuffled_w2,
                                                      requires_grad=False)
-            return
 
         # If checkpoint is fp8, we need to handle that the
         # MoE kernels require single activation scale and single weight
@@ -773,7 +770,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales,
                                                         requires_grad=False)
-            return
+
+        if current_platform.is_xpu():
+            import intel_extension_for_pytorch as ipex
+            layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
+                layer.w13_weight,
+                layer.w2_weight,
+                w1_scale=(layer.w13_weight_scale_inv
+                    if self.block_quant else layer.w13_weight_scale),
+                w2_scale=(layer.w2_weight_scale_inv
+                    if self.block_quant else layer.w2_weight_scale),
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                use_prepack=True,
+            )
 
     def apply(
         self,
@@ -793,6 +803,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
     ) -> torch.Tensor:
+        if current_platform.is_xpu():
+            return self.forward_xpu(
+                x=x,
+                layer=layer,
+                router_logits=router_logits,
+                top_k=top_k,
+                renormalize=renormalize,
+                use_grouped_topk=use_grouped_topk,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input)
         from vllm.model_executor.layers.fused_moe import fused_experts
 
         topk_weights, topk_ids = FusedMoE.select_experts(
@@ -830,6 +857,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             allow_deep_gemm=self.allow_deep_gemm,
         )
 
+    def forward_xpu(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            use_grouped_topk: bool,
+            top_k: int,
+            router_logits: torch.Tensor,
+            renormalize: bool,
+            topk_group: Optional[int] = None,
+            num_expert_group: Optional[int] = None,
+            custom_routing_function: Optional[Callable] = None,
+            **kwargs,
+    ):
+        assert custom_routing_function is None
+        return layer.ipex_fusion(
+            x,
+            use_grouped_topk,
+            top_k,
+            router_logits,
+            renormalize,
+            topk_group,
+            num_expert_group,
+        )
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):
     """
