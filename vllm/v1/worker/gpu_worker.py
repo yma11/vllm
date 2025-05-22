@@ -241,11 +241,7 @@ class Worker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
-        start_time = time.time()
         output = self.model_runner.execute_model(scheduler_output)
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        print(f"execute_model time: {elapsed_time:.2f} seconds", flush=True)
         return output if self.is_driver_worker else None
 
     def profile(self, is_start: bool = True):

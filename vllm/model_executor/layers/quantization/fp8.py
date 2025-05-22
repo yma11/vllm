@@ -627,9 +627,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 if _is_col_major(layer.w2_weight_scale_inv):
                     layer.w2_weight_scale_inv = \
                         dg.get_col_major_tma_aligned_tensor(layer.w2_weight_scale_inv).contiguous()
+            
+            return
 
         # If checkpoint is fp16, quantize in place.
-        elif not self.quant_config.is_checkpoint_fp8_serialized:
+        if not self.quant_config.is_checkpoint_fp8_serialized:
             fp8_dtype = current_platform.fp8_dtype()
             w13_weight = torch.empty_like(layer.w13_weight.data,
                                           dtype=fp8_dtype)
@@ -673,6 +675,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                                                       requires_grad=False)
                 layer.w2_weight = torch.nn.Parameter(shuffled_w2,
                                                      requires_grad=False)
+            
+            if current_platform.is_xpu():
+                import intel_extension_for_pytorch as ipex
+                layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    w1_scale=(layer.w13_weight_scale_inv
+                        if self.block_quant else layer.w13_weight_scale),
+                    w2_scale=(layer.w2_weight_scale_inv
+                        if self.block_quant else layer.w2_weight_scale),
+                    a1_scale=layer.w13_input_scale,
+                    a2_scale=layer.w2_input_scale,
+                    use_prepack=True,
+                )
+
+            return
 
         # If checkpoint is fp8, we need to handle that the
         # MoE kernels require single activation scale and single weight
@@ -761,20 +779,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales,
                                                         requires_grad=False)
-
-        if current_platform.is_xpu():
-            import intel_extension_for_pytorch as ipex
-            layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
-                layer.w13_weight,
-                layer.w2_weight,
-                w1_scale=(layer.w13_weight_scale_inv
-                    if self.block_quant else layer.w13_weight_scale),
-                w2_scale=(layer.w2_weight_scale_inv
-                    if self.block_quant else layer.w2_weight_scale),
-                a1_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                use_prepack=True,
-            )
+            return
 
     def apply(
         self,
