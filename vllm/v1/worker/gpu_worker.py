@@ -8,8 +8,6 @@ import torch
 import torch.distributed
 import torch.nn as nn
 
-import time
-
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.device_allocator.cumem import CuMemAllocator
