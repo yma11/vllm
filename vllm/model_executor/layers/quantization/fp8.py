@@ -636,7 +636,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 if _is_col_major(layer.w2_weight_scale_inv):
                     layer.w2_weight_scale_inv = \
                         dg.get_col_major_tma_aligned_tensor(layer.w2_weight_scale_inv).contiguous()
-            
+
             return
 
         # If checkpoint is fp16, quantize in place.
