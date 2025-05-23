@@ -681,12 +681,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
                     layer.w13_weight,
                     layer.w2_weight,
-                    w1_scale=(layer.w13_weight_scale_inv
+                    w1_scale_inv=(layer.w13_weight_scale_inv
                         if self.block_quant else layer.w13_weight_scale),
-                    w2_scale=(layer.w2_weight_scale_inv
+                    w2_scale_inv=(layer.w2_weight_scale_inv
                         if self.block_quant else layer.w2_weight_scale),
-                    a1_scale=layer.w13_input_scale,
-                    a2_scale=layer.w2_input_scale,
+                    a1_scale_inv=layer.w13_input_scale,
+                    a2_scale_inv=layer.w2_input_scale,
                     use_prepack=True,
                 )
 
