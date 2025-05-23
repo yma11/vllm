@@ -35,6 +35,7 @@ class XPUModelRunner(GPUModelRunner):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        self.counter = 0
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
