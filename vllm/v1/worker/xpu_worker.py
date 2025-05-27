@@ -12,6 +12,7 @@ from vllm.distributed import (ensure_model_parallel_initialized,
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.platforms import current_platform
+from vllm.utils import supports_xccl
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.xpu_model_runner import XPUModelRunner
 
@@ -170,6 +171,8 @@ def init_worker_distributed_environment(
             "is not already initialized")
     else:
         # oneapi 2025 will use pidfd as default
+        default_backend = "xccl" if supports_xccl() else "ccl"
+        XPU_CCL_BACKEND = os.getenv("XPU_CCL_BACKEND", default_backend)
         ENV_CCL_ZE_IPC_EXCHANGE = os.getenv("CCL_ZE_IPC_EXCHANGE", "drmfd")
         ENV_CCL_ATL_TRANSPORT = os.getenv("CCL_ATL_TRANSPORT", "ofi")
         ENV_LOCAL_WORLD_SIZE = os.getenv("LOCAL_WORLD_SIZE",
@@ -183,7 +186,7 @@ def init_worker_distributed_environment(
             rank=rank,
             distributed_init_method=distributed_init_method,
             local_rank=local_rank,
-            backend="ccl")
+            backend=XPU_CCL_BACKEND)
 
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
