@@ -1218,7 +1218,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             del draft_probs
 
         if current_platform.is_xpu():
-            torch.xpu.empty_cache()
+            reserved_mem = torch.xpu.memory_reserved()
+            if reserved_mem >= self.vllm_config.cache_config.threshold_mem:
+                torch.xpu.empty_cache()
 
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,

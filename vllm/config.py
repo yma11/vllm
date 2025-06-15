@@ -1195,6 +1195,7 @@ class CacheConfig:
         # Will be set after profiling.
         self.num_gpu_blocks: Optional[int] = None
         self.num_cpu_blocks: Optional[int] = None
+        self.threshold_mem: Optional[int] = None
 
         # Set calculate_kv_scales to False if the value is unset.
         if self.calculate_kv_scales is None:
