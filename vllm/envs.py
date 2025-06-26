@@ -220,6 +220,7 @@ if TYPE_CHECKING:
     VLLM_GC_DEBUG: str = ""
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_XPU_FP8_DTYPE: str = "e5m2"
+    VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT: bool = False
 
 
 def get_default_cache_root():
@@ -1445,6 +1446,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # fp8 dtype for XPU platform
     "VLLM_XPU_FP8_DTYPE": lambda: os.environ.get("VLLM_XPU_FP8_DTYPE", "e5m2"),
+    # Offload model weights to cpu before online fp8 quantization
+    "VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT": lambda: os.environ.get(
+        "VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT", "0"
+    )
+    == "1",
 }
 
 # --8<-- [end:env-vars-definition]
