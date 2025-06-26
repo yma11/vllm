@@ -439,11 +439,15 @@ class Fp8LinearMethod(LinearMethodBase):
             )
         else:
             # For non-serialized checkpoints, use original dtype
+            # Force offloading weights to cpu if VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT
+            # enabled, otherwise use original device config which can be gpu or cpu
+            # (may happen when cpu_offload_gb > 0)
             weight = ModelWeightParameter(
                 data=torch.empty(
                     output_size_per_partition,
                     input_size_per_partition,
                     dtype=params_dtype,
+                    device="cpu" if envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT else None,
                 ),
                 input_dim=1,
                 output_dim=0,
@@ -775,6 +779,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 2 * intermediate_size_per_partition,
                 hidden_size,
                 dtype=params_dtype,
+                device="cpu" if envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT else None,
             ),
             requires_grad=False,
         )
@@ -787,6 +792,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,
+                device="cpu" if envs.VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT else None,
             ),
             requires_grad=False,
         )
