@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     VLLM_USE_DEEP_GEMM: bool = False
     VLLM_XPU_FP8_DTYPE: str = "e5m2"
     VLLM_XGRAMMAR_CACHE_MB: int = 0
+    VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT: bool = False
 
 
 def get_default_cache_root():
@@ -703,6 +704,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # It can be changed with this variable if needed for some reason.
     "VLLM_XGRAMMAR_CACHE_MB":
     lambda: int(os.getenv("VLLM_XGRAMMAR_CACHE_MB", "512")),
+
+    # Offload model weights to cpu before online fp8 quantization
+    "VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT":
+    lambda: os.environ.get("VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT", "0") == "1",
 }
 
 # end-env-vars-definition

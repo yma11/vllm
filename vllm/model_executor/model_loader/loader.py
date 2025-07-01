@@ -31,7 +31,7 @@ from vllm.config import (LoadConfig, LoadFormat, ModelConfig, ParallelConfig,
                          VllmConfig, set_current_vllm_config)
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
-from vllm.envs import VLLM_USE_MODELSCOPE
+from vllm.envs import VLLM_USE_MODELSCOPE, VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (LinearBase,
                                                MergedColumnParallelLinear,
@@ -82,6 +82,8 @@ def device_loading_context(module: torch.nn.Module,
         yield module
 
     finally:
+        if VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT:
+            return
         # Restore parameters to their original devices, ignoring new parameters
         pin_memory = is_pin_memory_available()
         for name, p in module.named_parameters():
