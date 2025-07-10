@@ -1436,11 +1436,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if has_kv_transfer_group():
             get_kv_transfer_group().clear_connector_metadata()
 
-        if current_platform.is_xpu():
-            reserved_mem = torch.xpu.memory_reserved()
-            if reserved_mem >= self.vllm_config.cache_config.threshold_mem:
-                torch.xpu.empty_cache()
-
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
