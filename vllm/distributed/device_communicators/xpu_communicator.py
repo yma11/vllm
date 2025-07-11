@@ -19,18 +19,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
         super().__init__(cpu_group, device, device_group, unique_name)
 
     def all_reduce(self, input_) -> torch.Tensor:
-        tmp_buffer = 8 * 1024 * 1024
-        chunk_size = int(tmp_buffer / input_.element_size())
-        numel = input_.numel()
-        chunks = (numel + chunk_size - 1) // chunk_size
-        flat = input_.view(-1)
-
-        for i in range(chunks):
-            start = i * chunk_size
-            end = min(start + chunk_size, numel)
-            chunk = flat[start:end]
-            dist.all_reduce(chunk, group=self.device_group)
-
+        dist.all_reduce(input_, group=self.device_group)
         return input_
 
     def gather(self,
