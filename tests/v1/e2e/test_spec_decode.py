@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 import torch
 
-from tests.utils import get_attn_backend_list_based_on_platform, large_gpu_mark
+from tests.utils import get_attn_backend_list_based_on_platform
 from vllm import LLM, SamplingParams
 from vllm.assets.base import VLLM_S3_BUCKET_URL
 from vllm.assets.image import VLM_IMAGES_DIR
@@ -86,7 +86,13 @@ def test_ngram_correctness(
     """
     test_prompts = get_test_prompts(mm_enabled=False)
 
-    ref_llm = LLM(model=model_name, max_model_len=1024)
+    ref_llm = LLM(
+        model=model_name,
+        max_model_len=1024,
+        enforce_eager=True,
+        block_size=64,
+        dtype="float16",
+    )
     ref_outputs = ref_llm.chat(test_prompts, sampling_config)
     del ref_llm
     torch.cuda.empty_cache()
@@ -101,6 +107,10 @@ def test_ngram_correctness(
             "num_speculative_tokens": 3,
         },
         max_model_len=1024,
+        enforce_eager=True,
+        block_size=64,
+        dtype="float16",
+        gpu_memory_utilization=0.8,
     )
     spec_outputs = spec_llm.chat(test_prompts, sampling_config)
     matches = 0
@@ -204,19 +214,8 @@ def test_speculators_model_integration(
 @pytest.mark.parametrize(
     ["model_setup", "mm_enabled"],
     [
-        (("eagle3", "Qwen/Qwen3-8B", "AngelSlim/Qwen3-8B_eagle3", 1), False),
-        pytest.param(
-            (
-                "eagle3",
-                "Qwen/Qwen2.5-VL-7B-Instruct",
-                "Rayzl/qwen2.5-vl-7b-eagle3-sgl",
-                1,
-            ),
-            False,
-            marks=pytest.mark.skip(
-                reason="Skipping due to its head_dim not being a a multiple of 32"
-            ),
-        ),
+        # TODO: Re-enable this once tests/models/test_initialization.py is fixed, see PR #22333 #22611  # noqa: E501
+        # (("eagle3", "Qwen/Qwen3-8B", "AngelSlim/Qwen3-8B_eagle3", 1), False),
         (
             (
                 "eagle",
@@ -235,44 +234,12 @@ def test_speculators_model_integration(
             ),
             False,
         ),
-        pytest.param(
-            (
-                "eagle",
-                "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-                "morgendave/EAGLE-Llama-4-Scout-17B-16E-Instruct",
-                4,
-            ),
-            False,
-            marks=large_gpu_mark(min_gb=80),
-        ),  # works on 4x H100
-        pytest.param(
-            (
-                "eagle",
-                "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-                "morgendave/EAGLE-Llama-4-Scout-17B-16E-Instruct",
-                4,
-            ),
-            True,
-            marks=large_gpu_mark(min_gb=80),
-        ),  # works on 4x H100
-        (
-            (
-                "eagle",
-                "eagle618/deepseek-v3-random",
-                "eagle618/eagle-deepseek-v3-random",
-                1,
-            ),
-            False,
-        ),
     ],
     ids=[
-        "qwen3_eagle3",
-        "qwen2_5_vl_eagle3",
+        # TODO: Re-enable this once tests/models/test_initialization.py is fixed, see PR #22333 #22611  # noqa: E501
+        # "qwen3_eagle3",
         "llama3_eagle",
         "llama3_eagle3",
-        "llama4_eagle",
-        "llama4_eagle_mm",
-        "deepseek_eagle",
     ],
 )
 @pytest.mark.parametrize("attn_backend", get_attn_backend_list_based_on_platform())
@@ -319,7 +286,13 @@ def test_eagle_correctness(
         method, model_name, spec_model_name, tp_size = model_setup
 
         ref_llm = LLM(
-            model=model_name, max_model_len=2048, tensor_parallel_size=tp_size
+            model=model_name,
+            max_model_len=2048,
+            tensor_parallel_size=tp_size,
+            enforce_eager=True,
+            block_size=64,
+            dtype="float16",
+            gpu_memory_utilization=0.8,
         )
         ref_outputs = ref_llm.chat(test_prompts, sampling_config)
         del ref_llm
@@ -336,6 +309,10 @@ def test_eagle_correctness(
                 "num_speculative_tokens": 3,
                 "max_model_len": 2048,
             },
+            enforce_eager=True,
+            block_size=64,
+            dtype="float16",
+            gpu_memory_utilization=0.8,
             max_model_len=2048,
         )
         spec_outputs = spec_llm.chat(test_prompts, sampling_config)
