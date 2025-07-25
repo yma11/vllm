@@ -62,6 +62,9 @@ FROM vllm-base AS vllm-openai
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install accelerate hf_transfer pytest pytest_asyncio lm_eval[api] 'modelscope!=1.15.0'
 
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip uninstall oneccl oneccl-devel -y
+
 ENV VLLM_USAGE_SOURCE production-docker-image \
     TRITON_XPU_PROFILE 1
 # install development dependencies (for testing)
