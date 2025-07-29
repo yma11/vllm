@@ -2922,6 +2922,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         common_metadata = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc[:num_reqs + 1],
             query_start_loc_cpu=self.query_start_loc_cpu[:num_reqs + 1],
+            seq_start_loc=self.seq_start_loc[:num_reqs + 1],
+            seq_start_loc_cpu=self.seq_start_loc_cpu[:num_reqs + 1],
             seq_lens=self.seq_lens[:num_reqs],
             seq_lens_cpu=self.seq_lens_cpu[:num_reqs],
             num_computed_tokens_cpu=self.input_batch.
