@@ -1230,6 +1230,44 @@ class LLM:
 
         return [ClassificationRequestOutput.from_base(item) for item in items]
 
+    def reward(
+        self,
+        prompts: Union[PromptType, Sequence[PromptType]],
+        /,
+        *,
+        truncate_prompt_tokens: Optional[int] = None,
+        use_tqdm: Union[bool, Callable[..., tqdm]] = True,
+        pooling_params: Optional[Union[PoolingParams,
+                                       Sequence[PoolingParams]]] = None,
+        lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
+    ) -> list[PoolingRequestOutput]:
+        """
+        Generate rewards for each prompt.
+        Args:
+            prompts: The prompts to the LLM. You may pass a sequence of prompts
+                for batch inference. See [PromptType][vllm.inputs.PromptType]
+                for more details about the format of each prompts.
+            use_tqdm: If `True`, shows a tqdm progress bar.
+                If a callable (e.g., `functools.partial(tqdm, leave=False)`),
+                it is used to create the progress bar.
+                If `False`, no progress bar is created.
+            lora_request: LoRA request to use for generation, if any.
+            pooling_params: The pooling parameters for pooling. If None, we
+                use the default pooling parameters.
+        Returns:
+            A list of `PoolingRequestOutput` objects containing the
+            pooled hidden states in the same order as the input prompts.
+        """
+
+        return self.encode(
+            prompts,
+            use_tqdm=use_tqdm,
+            lora_request=lora_request,
+            pooling_params=pooling_params,
+            truncate_prompt_tokens=truncate_prompt_tokens,
+            pooling_task="encode",
+        )
+
     def _embedding_score(
         self,
         tokenizer: AnyTokenizer,
