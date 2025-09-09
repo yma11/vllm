@@ -53,6 +53,7 @@ class IPEXConfig(QuantizationConfig):
         modules_to_not_convert: list[str] | None = None,
         desc_act: bool | None = None,
         lm_head_quantized: bool | None = None,
+        is_qweight_sym: bool | None = None,
     ) -> None:
         super().__init__()
         self.method = method
@@ -73,6 +74,7 @@ class IPEXConfig(QuantizationConfig):
             raise ValueError(
                 f"IPEX quantization supports [awq, gptq], but got {self.method}."
             )
+        self.is_qweight_sym = is_qweight_sym
 
     def __repr__(self) -> str:
         return (
@@ -109,15 +111,33 @@ class IPEXConfig(QuantizationConfig):
             modules_to_not_convert = cls.get_from_keys_or(
                 config, ["modules_to_not_convert"], None
             )
+            is_qweight_sym = not cls.get_from_keys_or(
+                config, ["zero_point"], default=False
+            )
             return cls(
-                method, weight_bits, group_size, modules_to_not_convert, False, False
+                method,
+                weight_bits,
+                group_size,
+                modules_to_not_convert,
+                False,
+                False,
+                is_qweight_sym,
             )
         # otherwise for gptq
         weight_bits = cls.get_from_keys(config, ["bits"])
         group_size = cls.get_from_keys(config, ["group_size"])
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
         desc_act = cls.get_from_keys_or(config, ["desc_act"], default=False)
-        return cls(method, weight_bits, group_size, [], desc_act, lm_head_quantized)
+        is_qweight_sym = cls.get_from_keys_or(config, ["sym"], default=True)
+        return cls(
+            method,
+            weight_bits,
+            group_size,
+            [],
+            desc_act,
+            lm_head_quantized,
+            is_qweight_sym,
+        )
 
     @classmethod
     def override_quantization_method(
@@ -201,6 +221,7 @@ class IPEXGPTQLinearMethod(GPTQLinearMethod):
                 bias=bias,
                 group_size=self.quant_config.group_size,
                 quant_method=IPEXConfig.IPEX_QUANT_METHOD_MAP["gptq"],
+                weight_qscheme="sym" if self.quant_config.is_qweight_sym else "asym",
             )
         )
 
@@ -270,6 +291,7 @@ class IPEXAWQLinearMethod(AWQLinearMethod):
                 bias=bias,
                 group_size=self.quant_config.group_size,
                 quant_method=IPEXConfig.IPEX_QUANT_METHOD_MAP["awq"],  # type: ignore
+                weight_qscheme="sym" if self.quant_config.is_qweight_sym else "asym",
             )
         )
 
