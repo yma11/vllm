@@ -9,6 +9,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
 
 try:
     import intel_extension_for_pytorch as ipex
@@ -288,24 +289,20 @@ class ipex_ops:
         else:
             assert len(window_size) == 2
             real_window_size = (window_size[0], window_size[1])
-        return ipex.llm.modules.PagedAttention.flash_attn_varlen_func(
-            out,
-            q.contiguous(),
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            softmax_scale,
-            causal,
-            block_table,
-            alibi_slopes,
-            softcap=softcap,
-            window_size_left=real_window_size[0],
-            window_size_right=real_window_size[1],
-            k_scale=1.0,
-            v_scale=1.0,
+        return flash_attn_varlen_func(
+            out = out,
+            q = q.contiguous(),
+            k = k,
+            v = v,
+            cu_seqlens_q = cu_seqlens_q,
+            cu_seqlens_k = cu_seqlens_k,
+            max_seqlen_q = max_seqlen_q,
+            max_seqlen_k = max_seqlen_k,
+            softmax_scale = softmax_scale,
+            causal = causal,
+            block_table = block_table,
+            #alibi_slopes = alibi_slopes,
+            #softcap=softcap,
         )
 
     @staticmethod
