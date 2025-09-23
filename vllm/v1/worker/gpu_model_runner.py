@@ -1267,6 +1267,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_draft_tokens = None
             spec_decode_metadata = None
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+            self.num_decode_draft_tokens.gpu = None
+            self.num_accepted_tokens.gpu = None
         else:
             # Get the number of draft tokens for each request.
             # Iterate over the dictionary rather than all requests since not all
@@ -1297,6 +1299,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
+            if self.num_decode_draft_tokens.gpu is None:
+                self.num_decode_draft_tokens.gpu = self.num_decode_draft_tokens.cpu.to(
+                    self.device
+                )
             self.num_decode_draft_tokens.copy_to_gpu()
 
         # Hot-Swap lora model
@@ -1380,6 +1386,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs]
             )
             self.num_accepted_tokens.np[num_reqs:].fill(1)
+            if self.num_accepted_tokens.gpu is None:
+                self.num_accepted_tokens.gpu = self.num_accepted_tokens.cpu.to(
+                    self.device
+                )
             self.num_accepted_tokens.copy_to_gpu()
 
         # Prepare the attention metadata for each KV cache group and make layers
