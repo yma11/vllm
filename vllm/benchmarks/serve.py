@@ -431,7 +431,7 @@ async def benchmark(
         input_requests[0].prompt,
         input_requests[0].prompt_len,
         #input_requests[0].expected_output_len,
-        10,
+        1,
         input_requests[0].multi_modal_data,
     )
 

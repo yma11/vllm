@@ -27,7 +27,7 @@ class XPUModelRunner(GPUModelRunner):
             super().__init__(vllm_config, device)
         # FIXME: To be verified.
         self.cascade_attn_enabled = False
-
+        self.step = 0
     def _init_device_properties(self) -> None:
         self.num_sms = None
 
