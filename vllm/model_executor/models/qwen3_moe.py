@@ -49,6 +49,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.gptq import GPTQConfig
 from vllm.model_executor.layers.quantization.gptq_marlin import (
     GPTQMarlinConfig)
+from vllm.model_executor.layers.quantization.ipex_quant import IPEXConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
@@ -165,6 +166,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if isinstance(
                 quant_config,
             (GPTQConfig,
+             IPEXConfig,
              GPTQMarlinConfig)) and not quant_config.autoround_version:
             return None
         return quant_config

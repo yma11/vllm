@@ -940,6 +940,7 @@ class FusedMoE(CustomOp):
         # need full intermediate size pre-sharding for WNA16 act order
         if (self.quant_method.__class__.__name__
                 in ("GPTQMarlinMoEMethod",
+                    "XPUGPTQMarlinMoEMethod",
                     "CompressedTensorsWNA16MarlinMoEMethod",
                     "CompressedTensorsWNA16MoEMethod")):
             moe_quant_params["intermediate_size_full"] = intermediate_size

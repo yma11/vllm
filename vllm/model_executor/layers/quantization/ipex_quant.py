@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import torch
 from packaging import version
@@ -12,6 +12,7 @@ from vllm._ipex_ops import ipex_ops as ops
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe import (FusedMoEMethodBase,
                                                   FusedMoeWeightScaleSupported)
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -22,8 +23,10 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.fp8 import (Fp8Config,
                                                          Fp8LinearMethod)
 from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
+from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinMoEMethod
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.scalar_type import scalar_types
 
 MIN_IPEX_VERSION = "2.6.0"
 
@@ -38,6 +41,11 @@ class IPEXConfig(QuantizationConfig):
         "gptq": 0,
     }
 
+    TYPE_MAP = {
+        (4, True): scalar_types.uint4b8,
+        (8, True): scalar_types.uint8b128,
+    }
+
     def __init__(
         self,
         method: str,
@@ -47,15 +55,19 @@ class IPEXConfig(QuantizationConfig):
         desc_act: Optional[bool] = None,
         lm_head_quantized: Optional[bool] = None,
         is_qweight_sym: Optional[bool] = None,
+        full_config: dict[str, Any] = None,
     ) -> None:
         super().__init__()
         self.method = method
+        self.linear_quant_method = method
         self.weight_bits = weight_bits
         self.group_size = group_size
         self.modules_to_not_convert = modules_to_not_convert or []
         self.desc_act = desc_act
         self.lm_head_quantized = lm_head_quantized
+        self.full_config = full_config
         self.pack_factor = 32 // self.weight_bits
+        self.bit8_pack_factor = 8 // self.weight_bits
 
         if self.weight_bits not in [4]:
             raise ValueError(f"IPEX quantization supports weight bits [4], "
@@ -65,6 +77,11 @@ class IPEXConfig(QuantizationConfig):
             raise ValueError(f"IPEX quantization supports [awq, gptq], "
                              f"but got {self.method}.")
         self.is_qweight_sym = is_qweight_sym
+        self.is_sym = is_qweight_sym
+
+        self.quant_type = self.TYPE_MAP[(weight_bits, is_qweight_sym)]
+        # used to identify GPTQ model quantized by autoround
+        self.autoround_version = full_config.get("autoround_version", "")
 
     def __repr__(self) -> str:
         return (f"IPEXConfig(method={self.method},"
@@ -110,7 +127,7 @@ class IPEXConfig(QuantizationConfig):
         desc_act = cls.get_from_keys_or(config, ["desc_act"], default=False)
         is_qweight_sym = cls.get_from_keys_or(config, ["sym"], default=True)
         return cls(method, weight_bits, group_size, [], desc_act,
-                   lm_head_quantized, is_qweight_sym)
+                   lm_head_quantized, is_qweight_sym, config)
 
     @classmethod
     def override_quantization_method(
@@ -134,6 +151,9 @@ class IPEXConfig(QuantizationConfig):
                 return IPEXAWQLinearMethod(self)
             if self.method == "gptq":
                 return IPEXGPTQLinearMethod(self)
+        if isinstance(layer, FusedMoE):
+            if self.method == "gptq":
+                return XPUGPTQMarlinMoEMethod(self, layer.moe_config)
         return None
 
 
@@ -419,3 +439,63 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
             num_expert_group,
             custom_routing_function=custom_routing_function,
         )
+
+class XPUGPTQMarlinMoEMethod(GPTQMarlinMoEMethod):
+    def __init__(
+        self,
+        quant_config: IPEXConfig,
+        moe: "FusedMoEConfig",
+    ) -> None:
+        super().__init__(quant_config, moe)
+        self.quant_config = quant_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        import intel_extension_for_pytorch as ipex
+        if self.quant_config.linear_quant_method == "gptq":
+            layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
+                layer.w13_qweight.permute(0, 2, 1),
+                layer.w2_qweight.permute(0, 2, 1),
+                w1_scale_inv=layer.w13_scales.permute(0, 2, 1),
+                w2_scale_inv=layer.w2_scales.permute(0, 2, 1),
+                is_int4=True
+            )
+        else:
+            raise NotImplementedError(
+                f"Unsupported quant method {self.quant_config.linear_quant_method} "
+                "for XPU MOE.")
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
+        activation: str = "silu",
+        enable_eplb: bool = False,
+        expert_load_view: Optional[torch.Tensor] = None,
+        logical_to_physical_map: Optional[torch.Tensor] = None,
+        logical_replica_count: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        res = layer.ipex_fusion(
+            x,
+            use_grouped_topk,
+            top_k,
+            router_logits,
+            renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+        )
+        return res
