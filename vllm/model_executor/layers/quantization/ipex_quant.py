@@ -11,6 +11,7 @@ from torch.nn.parameter import Parameter
 
 import vllm.envs as envs
 from vllm._ipex_ops import ipex_ops as ops
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
@@ -30,11 +31,11 @@ from vllm.model_executor.layers.quantization.awq import (
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
-from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinMoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
+from vllm.utils import round_up
 
 MIN_IPEX_VERSION = "2.6.0"
 
@@ -494,7 +495,7 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
         )
 
 
-class XPUGPTQMarlinMoEMethod(GPTQMarlinMoEMethod):
+class XPUGPTQMarlinMoEMethod(FusedMoEMethodBase):
     TYPE_MAP = {
         (4, True): scalar_types.uint4b8,
         (8, True): scalar_types.uint8b128,
@@ -505,12 +506,164 @@ class XPUGPTQMarlinMoEMethod(GPTQMarlinMoEMethod):
         quant_config: IPEXConfig,
         moe: "FusedMoEConfig",
     ) -> None:
-        super().__init__(quant_config, moe)
+        super().__init__(moe)
         self.quant_config = quant_config
+        if self.quant_config.quant_type.size_bits == 4:
+            self.quant_type = scalar_types.uint4b8
+        else:
+            raise ValueError("XPUGPTQMarlinMoEMethod only supports int4 now.")
 
-        weight_bits = quant_config.weight_bits
-        is_qweight_sym = quant_config.is_qweight_sym
-        self.quant_type = self.TYPE_MAP[(weight_bits, is_qweight_sym)]
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
+
+        self.is_k_full = (not self.quant_config.desc_act) or (
+            intermediate_size_per_partition == intermediate_size_full
+        )
+
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size == 4:
+            intermediate_size_per_partition = round_up(
+                intermediate_size_per_partition, 256
+            )
+        elif tp_size == 8:
+            intermediate_size_per_partition = round_up(
+                intermediate_size_per_partition, 128
+            )
+
+        if self.quant_config.group_size != -1:
+            scales_size13 = hidden_size // self.quant_config.group_size
+            w2_scales_size = (
+                intermediate_size_full
+                if self.quant_config.desc_act
+                else intermediate_size_per_partition
+            )
+            scales_size2 = w2_scales_size // self.quant_config.group_size
+            strategy = FusedMoeWeightScaleSupported.GROUP.value
+        else:
+            scales_size13 = 1
+            scales_size2 = 1
+            strategy = FusedMoeWeightScaleSupported.CHANNEL.value
+
+        extra_weight_attrs.update({"quant_method": strategy, "is_transposed": True})
+        # Fused gate_up_proj (column parallel)
+        w13_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size // self.quant_config.pack_factor,
+                2 * intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_qweight", w13_qweight)
+        set_weight_attrs(w13_qweight, extra_weight_attrs)
+        # down_proj (row parallel)
+        w2_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition // self.quant_config.pack_factor,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_qweight", w2_qweight)
+        set_weight_attrs(w2_qweight, extra_weight_attrs)
+        # up_proj scales
+        w13_scales = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                scales_size13,
+                2 * intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_scales", w13_scales)
+        set_weight_attrs(w13_scales, extra_weight_attrs)
+        # down_proj scales
+        w2_scales = torch.nn.Parameter(
+            torch.empty(num_experts, scales_size2, hidden_size, dtype=params_dtype),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_scales", w2_scales)
+        set_weight_attrs(w2_scales, extra_weight_attrs)
+        # don't shard the w2 scales when running act order
+        set_weight_attrs(w2_scales, {"load_full_w2": self.quant_config.desc_act})
+        # up_proj scales
+        w13_qzeros = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                scales_size13,
+                2 * intermediate_size_per_partition // self.quant_config.pack_factor,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_qzeros", w13_qzeros)
+        set_weight_attrs(w13_qzeros, extra_weight_attrs)
+        # down_proj scales
+        w2_qzeros = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                scales_size2,
+                hidden_size // self.quant_config.pack_factor,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_qzeros", w2_qzeros)
+        set_weight_attrs(w2_qzeros, extra_weight_attrs)
+        # don't shard the w2 scales when running act order
+        set_weight_attrs(w2_qzeros, {"load_full_w2": self.quant_config.desc_act})
+        w13_g_idx = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_g_idx", w13_g_idx)
+        set_weight_attrs(w13_g_idx, extra_weight_attrs)
+        w2_g_idx = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_g_idx", w2_g_idx)
+        set_weight_attrs(w2_g_idx, extra_weight_attrs)
+        w13_g_idx_sort_indices = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_g_idx_sort_indices", w13_g_idx_sort_indices)
+        set_weight_attrs(w13_g_idx_sort_indices, extra_weight_attrs)
+        w2_g_idx_sort_indices = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort_indices)
+        set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         import intel_extension_for_pytorch as ipex

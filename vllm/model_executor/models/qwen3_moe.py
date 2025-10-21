@@ -63,6 +63,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
+from vllm.utils import round_up
 
 from .interfaces import MixtureOfExperts, SupportsEagle3, SupportsLoRA, SupportsPP
 from .utils import (
@@ -508,7 +509,55 @@ class Qwen3MoeModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
+        is_padding_needed = False
+        quantization_config = getattr(self.config, "quantization_config", None)
+        if quantization_config is not None:
+            quant_method = quantization_config.get("quant_method", "").lower()
+        tp_size = get_tensor_model_parallel_world_size()
+        if (quant_method in ("gptq")) and (tp_size == 4 or tp_size == 8):
+            is_padding_needed = True
         for name, loaded_weight in weights:
+            if is_padding_needed:
+                if ".down_proj.g_idx" in name:
+                    shape0 = loaded_weight.shape[0]
+                    target_size = round_up(shape0, 1024)
+                    pad_size = target_size - shape0
+                    loaded_weight = torch.nn.functional.pad(
+                        loaded_weight, (0, pad_size), value=0
+                    )
+                elif ".down_proj.qweight" in name:
+                    shape0 = loaded_weight.shape[0]
+                    target_size = round_up(shape0, 128)
+                    pad_size = target_size - shape0
+                    loaded_weight = torch.nn.functional.pad(
+                        loaded_weight, (0, 0, 0, pad_size), value=0
+                    )
+                elif ".down_proj.scales" in name or ".down_proj.qzeros" in name:
+                    shape0 = loaded_weight.shape[0]
+                    target_size = round_up(shape0, 8)
+                    pad_size = target_size - shape0
+                    loaded_weight = torch.nn.functional.pad(
+                        loaded_weight, (0, 0, 0, pad_size), value=0
+                    )
+                elif (
+                    ".gate_proj.qweight" in name
+                    or ".gate_proj.scales" in name
+                    or ".up_proj.qweight" in name
+                    or ".up_proj.scales" in name
+                ):
+                    shape1 = loaded_weight.shape[1]
+                    target_size = round_up(shape1, 1024)
+                    pad_size = target_size - shape1
+                    loaded_weight = torch.nn.functional.pad(
+                        loaded_weight, (0, pad_size), value=0
+                    )
+                elif ".gate_proj.qzeros" in name or ".up_proj.qzeros" in name:
+                    shape1 = loaded_weight.shape[1]
+                    target_size = round_up(shape1, 128)
+                    pad_size = target_size - shape1
+                    loaded_weight = torch.nn.functional.pad(
+                        loaded_weight, (0, pad_size), value=0
+                    )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
