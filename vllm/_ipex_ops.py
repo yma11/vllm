@@ -162,14 +162,14 @@ class ipex_ops:
     @staticmethod
     def rms_norm(input: torch.Tensor, weight: torch.Tensor,
                  epsilon: float) -> torch.Tensor:
-        return ipex.llm.functional.rms_norm(input, weight, epsilon)
+        out = torch.empty_like(input)
+        torch.ops.torch_ipex.rms_norm_vllm(out, input, weight, epsilon)
+        return out
 
     @staticmethod
     def fused_add_rms_norm(input: torch.Tensor, residual: torch.Tensor,
                            weight: torch.Tensor, epsilon: float) -> None:
-        tmp = ipex.llm.functional.add_rms_norm(residual, input, weight, None,
-                                               epsilon, True)
-        input.copy_(tmp)
+        torch.ops.torch_ipex.fused_add_rms_norm_vllm(input, residual, weight, epsilon)
 
     @staticmethod
     def varlen_attention(
