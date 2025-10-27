@@ -501,6 +501,11 @@ class XPUGPTQMarlinMoEMethod(FusedMoEMethodBase):
         (8, True): scalar_types.uint8b128,
     }
 
+    TYPE_MAP = {
+        (4, True): scalar_types.uint4b8,
+        (8, True): scalar_types.uint8b128,
+    }
+
     def __init__(
         self,
         quant_config: IPEXConfig,
@@ -508,9 +513,12 @@ class XPUGPTQMarlinMoEMethod(FusedMoEMethodBase):
     ) -> None:
         super().__init__(moe)
         self.quant_config = quant_config
-        if self.quant_config.quant_type.size_bits == 4:
-            self.quant_type = scalar_types.uint4b8
-        else:
+
+        weight_bits = quant_config.weight_bits
+        is_qweight_sym = quant_config.is_qweight_sym
+        self.quant_type = self.TYPE_MAP[(weight_bits, is_qweight_sym)]
+
+        if self.quant_type.size_bits != 4:
             raise ValueError("XPUGPTQMarlinMoEMethod only supports int4 now.")
 
     def create_weights(
