@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 import torch
 from packaging import version
+from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
@@ -31,11 +32,16 @@ from vllm.model_executor.layers.quantization.awq import (
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
+from vllm.model_executor.layers.quantization.utils.gptq_utils import (
+    get_linear_quant_method,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
-from vllm.utils import round_up
+from vllm.transformers_utils.config import get_safetensors_params_metadata
+from vllm.utils.collection_utils import is_list_of
+from vllm.utils.math_utils import round_up
 
 MIN_IPEX_VERSION = "2.6.0"
 
@@ -57,12 +63,15 @@ class IPEXConfig(QuantizationConfig):
         group_size: int,
         is_qweight_sym: bool,
         full_config: dict[str, Any],
+        dynamic: dict[str, dict[str, int | bool]],
         modules_to_not_convert: list[str] | None = None,
         desc_act: bool | None = None,
         lm_head_quantized: bool | None = None,
-        # full_config: dict[str, Any] = None,
+        modules_in_block_to_quantize: list[str] | None = None,
+        checkpoint_format: str = "",
     ) -> None:
         super().__init__()
+        self.dynamic = dynamic
         self.method = method
         self.linear_quant_method = method
         self.weight_bits = weight_bits
@@ -70,8 +79,8 @@ class IPEXConfig(QuantizationConfig):
         self.modules_to_not_convert = modules_to_not_convert or []
         self.desc_act = desc_act
         self.lm_head_quantized = lm_head_quantized
-        if full_config is not None:
-            self.full_config = full_config
+        self.modules_in_block_to_quantize = modules_in_block_to_quantize or []
+        self.full_config = full_config
         self.pack_factor = 32 // self.weight_bits
         self.bit8_pack_factor = 8 // self.weight_bits
 
@@ -90,12 +99,19 @@ class IPEXConfig(QuantizationConfig):
         self.autoround_version = (
             full_config.get("autoround_version", "") if full_config is not None else ""
         )
+        # GPTQ v1 and v2 format deals with zero points differently.
+        # Currently GPTQModel stores v1 format checkpoints by default,
+        # but provides the option to set `format="gptq_v2"` in `QuantizeConfig`.
+        self.checkpoint_format = checkpoint_format
 
     def __repr__(self) -> str:
         return (
             f"IPEXConfig(method={self.method},"
             f"weight_bits={self.weight_bits}, "
-            f"group_size={self.group_size})"
+            f"group_size={self.group_size}),"
+            f"dynamic={self.dynamic}, "
+            f"modules_in_block_to_quantize={self.modules_in_block_to_quantize}),"
+            f"checkpoint_format={self.checkpoint_format})"
         )
 
     @classmethod
@@ -119,6 +135,8 @@ class IPEXConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "IPEXConfig":
+        dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
+        dynamic = {} if dynamic is None else dynamic
         method = cls.get_from_keys(config, ["quant_method"]).lower()
         if method == "awq":
             weight_bits = cls.get_from_keys(config, ["w_bit", "bits"])
@@ -135,6 +153,7 @@ class IPEXConfig(QuantizationConfig):
                 group_size,
                 is_qweight_sym,
                 config,
+                dynamic,
                 modules_to_not_convert,
                 False,
                 False,
@@ -145,15 +164,24 @@ class IPEXConfig(QuantizationConfig):
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
         desc_act = cls.get_from_keys_or(config, ["desc_act"], default=False)
         is_qweight_sym = cls.get_from_keys_or(config, ["sym"], default=True)
+        modules_in_block_to_quantize = cls.get_from_keys_or(
+            config, ["modules_in_block_to_quantize"], default=None
+        )
+        checkpoint_format = cls.get_from_keys_or(
+            config, ["checkpoint_format"], default=""
+        )
         return cls(
             method,
             weight_bits,
             group_size,
             is_qweight_sym,
             config,
+            dynamic,
             [],
             desc_act,
             lm_head_quantized,
+            modules_in_block_to_quantize,
+            checkpoint_format,
         )
 
     @classmethod
@@ -181,10 +209,41 @@ class IPEXConfig(QuantizationConfig):
                     return UnquantizedLinearMethod()
                 return IPEXAWQLinearMethod(self)
             if self.method == "gptq":
-                return IPEXGPTQLinearMethod(self)
+                return get_linear_quant_method(
+                    self, layer, prefix, IPEXGPTQLinearMethod
+                )
+                # return IPEXGPTQLinearMethod(self)
         if isinstance(layer, FusedMoE) and self.method == "gptq":
             return XPUGPTQMarlinMoEMethod(self, layer.moe_config)
         return None
+
+    def apply_vllm_mapper(self, hf_to_vllm_mapper):
+        if self.modules_in_block_to_quantize is not None:
+            self.modules_in_block_to_quantize = hf_to_vllm_mapper.apply_list(
+                self.modules_in_block_to_quantize
+            )
+
+    def maybe_update_config(self, model_name: str, revision: str | None = None):
+        if self.modules_in_block_to_quantize:
+            if is_list_of(self.modules_in_block_to_quantize, list):
+                # original modules_in_block_to_quantize: list[list[str]]
+                # flatten original modules_in_block_to_quantize
+                self.modules_in_block_to_quantize = [
+                    item
+                    for sublist in self.modules_in_block_to_quantize
+                    for item in sublist
+                ]
+            return
+
+        unquant_dtypes = [torch.float16, torch.bfloat16, torch.float32]
+        metadata = get_safetensors_params_metadata(model_name, revision=revision)
+        quant_layers: set[str] = {
+            param_name.rsplit(".", 1)[0]
+            for param_name, info in metadata.items()
+            if (dtype := info.get("dtype", None))
+            and _SAFETENSORS_TO_TORCH_DTYPE[dtype] not in unquant_dtypes
+        }
+        self.modules_in_block_to_quantize = list(quant_layers)
 
 
 class IPEXGPTQLinearMethod(GPTQLinearMethod):
@@ -501,11 +560,6 @@ class XPUGPTQMarlinMoEMethod(FusedMoEMethodBase):
         (8, True): scalar_types.uint8b128,
     }
 
-    TYPE_MAP = {
-        (4, True): scalar_types.uint4b8,
-        (8, True): scalar_types.uint8b128,
-    }
-
     def __init__(
         self,
         quant_config: IPEXConfig,
@@ -520,6 +574,11 @@ class XPUGPTQMarlinMoEMethod(FusedMoEMethodBase):
 
         if self.quant_type.size_bits != 4:
             raise ValueError("XPUGPTQMarlinMoEMethod only supports int4 now.")
+
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module
+    ) -> FusedMoEQuantConfig | None:
+        return None
 
     def create_weights(
         self,
@@ -545,7 +604,6 @@ class XPUGPTQMarlinMoEMethod(FusedMoEMethodBase):
             intermediate_size_per_partition = round_up(
                 intermediate_size_per_partition, 128
             )
-
         if self.quant_config.group_size != -1:
             scales_size13 = hidden_size // self.quant_config.group_size
             w2_scales_size = (
