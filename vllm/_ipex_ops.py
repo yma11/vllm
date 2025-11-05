@@ -334,11 +334,14 @@ class ipex_ops:
             )
             return out
         else:
+            # TODO：IPEX chunk prefill only support contiguous k,v
+            # The kernel need support incontiguous k, v
+            # And this causes mamba spec model low gpu-util
             return ipex.llm.modules.PagedAttention.flash_attn_varlen_func(
                 out,
                 q.contiguous(),
-                k,
-                v,
+                k.contiguous(),
+                v.contiguous(),
                 cu_seqlens_q,
                 seqused_k,
                 max_seqlen_q,

@@ -21,6 +21,7 @@ from .solve_tril import solve_tril
 from .utils import SUPPRESS_LEVEL, input_guard
 from .wy_fast import recompute_w_u_fwd
 
+from vllm.platforms import current_platform
 
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
@@ -74,7 +75,7 @@ def chunk_gated_delta_rule_fwd(
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
-    @torch.amp.custom_fwd(device_type="cuda")
+    @torch.amp.custom_fwd(device_type='xpu' if current_platform.is_xpu() else 'cuda')
     def forward(
         ctx,
         q: torch.Tensor,
