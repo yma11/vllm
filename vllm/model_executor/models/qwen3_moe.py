@@ -515,9 +515,9 @@ class Qwen3MoeModel(nn.Module):
         quantization_config = getattr(self.config, "quantization_config", None)
         if quantization_config is not None:
             quant_method = quantization_config.get("quant_method", "").lower()
-        tp_size = get_tensor_model_parallel_world_size()
-        if (quant_method in ("gptq")) and (tp_size == 4 or tp_size == 8):
-            is_padding_needed = True
+            tp_size = get_tensor_model_parallel_world_size()
+            if (quant_method in ("gptq")) and (tp_size == 4 or tp_size == 8):
+                is_padding_needed = True
         for name, loaded_weight in weights:
             if is_padding_needed:
                 if ".down_proj.g_idx" in name:
