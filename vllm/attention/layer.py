@@ -123,6 +123,7 @@ def maybe_get_vit_flash_attn_backend(
         ):
             attn_backend = _Backend.FLASH_ATTN
             use_upstream_fa = True
+    # TODO: revert back when flash_varlen_attn_func supports none block table case
     # elif current_platform.is_xpu():
     #    assert attn_backend == _Backend.FLASH_ATTN, (
     #        "XPU platform only supports FLASH_ATTN as vision attention backend."
