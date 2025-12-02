@@ -16,6 +16,8 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+import os
+from torch.profiler import profile, record_function, ProfilerActivity
 from tqdm import tqdm
 
 import vllm.envs as envs
@@ -2516,6 +2518,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+
+        is_checkpoint = False
+        is_rank0 = get_tp_group().rank == 0
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -2524,6 +2529,30 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("Preprocess"):
             with self.synchronize_input_prep():
+                if is_rank0:
+                    print(f"total_requests_num: {len(scheduler_output.num_scheduled_tokens)}")
+                    print(f"total_num_scheduled_tokens: {scheduler_output.total_num_scheduled_tokens}")
+                    num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+                    # for new reqs
+                    scheduled_new_reqs_list = scheduler_output.scheduled_new_reqs
+                    cached_reqs_data = scheduler_output.scheduled_cached_reqs
+                    cached_req_ids = cached_reqs_data.req_ids
+                    cached_num_computed_tokens = cached_reqs_data.num_computed_tokens
+                    for req in scheduled_new_reqs_list:
+                        print(f"    request id: {req.req_id}")
+                        print(f"        context_len: {req.num_computed_tokens}")
+                        print(f"        num_scheduled_token: {num_scheduled_tokens[req.req_id]}")
+                        if num_scheduled_tokens[req.req_id] > 1:
+                            # profile if there is prefill for any request
+                            is_checkpoint = True
+                    for i in range(len(cached_req_ids)):
+                        print(f"    request id: {cached_req_ids[i]}")
+                        print(f"        context_len: {cached_num_computed_tokens[i]}")
+                        print(f"        num_scheduled_token: {num_scheduled_tokens[cached_req_ids[i]]}")
+                        if num_scheduled_tokens[cached_req_ids[i]] > 1:
+                            # profile if there is prefill for any request
+                            is_checkpoint = True
+                start_time = time.time()
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
 
@@ -2596,6 +2625,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     scheduler_output.total_num_scheduled_tokens
                 )
 
+            num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+            if num_scheduled_tokens >= 1 and is_rank0:
+                self.step += 1
             (
                 input_ids,
                 inputs_embeds,
@@ -2635,27 +2667,74 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_input_tokens,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_descriptor,
-                ubatch_slices=ubatch_slices,
-            ),
-            record_function_or_nullcontext("Forward"),
-            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+        do_profile = os.environ.get("PROFILE", "ON").upper() in ["1", "Y", "ON", "YES", "TRUE"]
+        profile_every_n_steps = int(os.environ.get("PROFILE_INTERVAL", 1))
+        if self.step % profile_every_n_steps == 0:
+                is_checkpoint = True
+        start = time.time()
+        if is_checkpoint and do_profile:
+            prof = profile(
+                    activities=[
+                        #ProfilerActivity.CPU,  # Profile CPU operations
+                        ProfilerActivity.XPU  # Profile XPU operations if available
+                        ],
+                    #on_trace_ready=torch.profiler.tensorboard_trace_handler('./logs'),  # Save to TensorBoard logs
+                    record_shapes=True,  # Record operator input shapes
             )
+            with prof:
+                with (
+                        set_forward_context(
+                            attn_metadata,
+                            self.vllm_config,
+                            num_tokens=num_input_tokens,
+                            num_tokens_across_dp=num_tokens_across_dp,
+                            cudagraph_runtime_mode=cudagraph_runtime_mode,
+                            batch_descriptor=batch_descriptor,
+                            ubatch_slices=ubatch_slices,
+                            ),
+                        record_function_or_nullcontext("Forward"),
+                        self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+                        ):
+                    print(f"!!input_ids", input_ids)
+                    model_output = self._model_forward(
+                            input_ids=input_ids,
+                            positions=positions,
+                            intermediate_tensors=intermediate_tensors,
+                            inputs_embeds=inputs_embeds,
+                            **model_kwargs,
+                            )
+                    torch.xpu.synchronize()
+                    if is_rank0:
+                        print(f"execution time: {(time.time() - start_time)*1000} ms")
+                    end = time.time()
+                    m = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
+            if is_rank0 and num_scheduled_tokens >= 1:
+                rank = 0
+                #skip the print during decode of test run
+                logger.info("m = %d, step %d: self.model() time = %f", m, self.step, end - start)
+                # save the profiling results
+                torch.save(prof.key_averages().table(sort_by="self_xpu_time_total"), f"./data/vllm_profile_rank{rank}_step_{self.step}_m_{num_scheduled_tokens}.pt")
+                prof.export_chrome_trace(f"./data/vllm_trace_rank{rank}_step_{self.step}_m_{num_scheduled_tokens}.json")
 
+        else:
+            with (set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_input_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_descriptor,
+                    ubatch_slices=ubatch_slices,
+            ), record_function_or_nullcontext("Forward"),
+                self.maybe_get_kv_connector_output(scheduler_output) as
+                kv_connector_output):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
