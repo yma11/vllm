@@ -15,7 +15,7 @@ from vllm.distributed.kv_events import BlockStored, KVEventBatch
 from vllm.platforms import current_platform
 from vllm.utils.system_utils import set_env_var
 
-CPU_BLOCK_SIZES = [48]
+CPU_BLOCK_SIZES = [64] if current_platform.is_xpu() else [48]
 ATTN_BACKENDS = ["FLASH_ATTN"]
 
 if current_platform.is_cuda():
