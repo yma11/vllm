@@ -457,14 +457,14 @@ class TritonAttentionImpl(AttentionImpl):
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
 
-        # seq_threshold_3D = attn_metadata.seq_threshold_3D
-        # num_par_softmax_segments = attn_metadata.num_par_softmax_segments
-        # softmax_segm_output = attn_metadata.softmax_segm_output
-        # softmax_segm_max = attn_metadata.softmax_segm_max
-        # softmax_segm_expsum = attn_metadata.softmax_segm_expsum
+        seq_threshold_3D = attn_metadata.seq_threshold_3D
+        num_par_softmax_segments = attn_metadata.num_par_softmax_segments
+        softmax_segm_output = attn_metadata.softmax_segm_output
+        softmax_segm_max = attn_metadata.softmax_segm_max
+        softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
         descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
-        # mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+        mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         unified_attention(
             q=query[:num_actual_tokens],
@@ -484,14 +484,14 @@ class TritonAttentionImpl(AttentionImpl):
             q_descale=None,  # Not supported
             k_descale=layer._k_scale.expand(descale_shape),
             v_descale=layer._v_scale.expand(descale_shape),
-            # seq_threshold_3D=seq_threshold_3D,
-            # num_par_softmax_segments=num_par_softmax_segments,
-            # softmax_segm_output=softmax_segm_output,
-            # softmax_segm_max=softmax_segm_max,
-            # softmax_segm_expsum=softmax_segm_expsum,
+            seq_threshold_3D=seq_threshold_3D,
+            num_par_softmax_segments=num_par_softmax_segments,
+            softmax_segm_output=softmax_segm_output,
+            softmax_segm_max=softmax_segm_max,
+            softmax_segm_expsum=softmax_segm_expsum,
             sinks=self.sinks,
             output_scale=output_scale,
-            # mm_prefix_range=mm_prefix_range_tensor,
+            mm_prefix_range=mm_prefix_range_tensor,
         )
 
         return output
