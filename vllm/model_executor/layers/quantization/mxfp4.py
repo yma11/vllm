@@ -1158,6 +1158,9 @@ class XpuMxfp4MoEMethod(Mxfp4MoEMethod):
             topk_ids=selected_experts,
             n_experts_per_token=layer.top_k,
             activation=layer.activation,
-            num_experts=layer.global_num_experts,
+            num_experts=layer.global_num_experts
+            // self.moe.moe_parallel_config.ep_size,
+            ep_rank=self.moe.moe_parallel_config.ep_rank,
+            ep_size=self.moe.moe_parallel_config.ep_size,
             is_mxfp4=True,
         )

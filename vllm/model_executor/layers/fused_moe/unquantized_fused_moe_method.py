@@ -437,7 +437,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_ids=selected_experts,
             n_experts_per_token=layer.top_k,
             activation=layer.activation,
-            num_experts=layer.global_num_experts,
+            num_experts=layer.global_num_experts
+            // self.moe.moe_parallel_config.ep_size,
+            ep_rank=self.moe.moe_parallel_config.ep_rank,
+            ep_size=self.moe.moe_parallel_config.ep_size,
         )
 
     def forward_tpu(
