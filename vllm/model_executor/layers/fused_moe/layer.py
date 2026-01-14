@@ -51,7 +51,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-if current_platform.is_cuda_alike():
+if current_platform.is_cuda_alike() or current_platform.is_xpu():
     from .fused_moe import eplb_map_to_physical_and_record
 else:
 

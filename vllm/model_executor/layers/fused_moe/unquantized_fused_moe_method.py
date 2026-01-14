@@ -263,7 +263,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     layer.cpu_fused_moe = cpu_fused_moe.CPUFusedMOE(layer)
             else:
                 layer.cpu_fused_moe = cpu_fused_moe.CPUFusedMOE(layer)
-        elif current_platform.is_cuda_alike():
+        elif current_platform.is_cuda_alike() or envs.VLLM_XPU_MOE_USE_TRITON:
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
             self.kernel = mk.FusedMoEModularKernel(
                 MoEPrepareAndFinalizeNoEP(),
@@ -379,13 +379,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if (
-            layer.enable_eplb is not False
-            or layer.expert_load_view is not None
-            or layer.logical_to_physical_map is not None
-            or layer.logical_replica_count is not None
-        ):
-            raise NotImplementedError("Expert load balancing is not supported for XPU.")
         if envs.VLLM_XPU_MOE_USE_TRITON:
             return self.forward_cuda(
                 layer,
