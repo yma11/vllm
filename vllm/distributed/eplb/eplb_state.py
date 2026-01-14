@@ -43,12 +43,17 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import MixtureOfExperts
+from vllm.platforms import current_platform
 
 from .async_worker import start_async_worker
 from .policy import EPLB_POLICIES, AbstractEplbPolicy, DefaultEplbPolicy
 from .rebalance_execute import move_from_buffer, rearrange_expert_weights_inplace
 
 logger = init_logger(__name__)
+if current_platform.is_xpu():
+    torch.cuda.synchronize = torch.xpu.synchronize
+    torch.cuda.Event = torch.xpu.Event
+    torch.cuda.current_stream = torch.xpu.current_stream
 
 
 @dataclass
@@ -264,6 +269,10 @@ class EplbState:
             self.cuda_device_index = self.device.index
             if self.cuda_device_index is None and torch.cuda.is_available():
                 self.cuda_device_index = torch.cuda.current_device()
+        elif self.device.type == "xpu":
+            self.cuda_device_index = self.device.index
+            if self.cuda_device_index is None and torch.xpu.is_available():
+                self.cuda_device_index = torch.xpu.current_device()
 
     @staticmethod
     def build_initial_global_physical_to_logical_map(

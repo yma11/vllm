@@ -13,11 +13,17 @@ from torch.distributed import ProcessGroup
 
 from vllm.distributed.parallel_state import get_ep_group
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 from .rebalance_execute import transfer_layer
 
 if TYPE_CHECKING:
     from .eplb_state import EplbState
+
+if current_platform.is_xpu():
+    torch.cuda.Stream = torch.xpu.Stream
+    torch.cuda.set_device = torch.xpu.set_device
+    torch.cuda.Event = torch.xpu.Event
 
 logger = init_logger(__name__)
 

@@ -14,6 +14,9 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    eplb_map_to_physical_and_record,
+)
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
@@ -145,6 +148,10 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
     ) -> FusedMoEQuantConfig | None:
         return None
 
+    @property
+    def supports_eplb(self) -> bool:
+        return True
+
     def apply(
         self,
         layer: FusedMoE,
@@ -181,6 +188,18 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
                 router_logits,
                 layer.renormalize,
             )
+        if layer.enable_eplb:
+            selected_experts = eplb_map_to_physical_and_record(
+                topk_ids=selected_experts,
+                expert_load_view=layer.expert_load_view,
+                logical_to_physical_map=layer.logical_to_physical_map,
+                logical_replica_count=layer.logical_replica_count,
+            )
+        indices_type = layer.quant_method.topk_indices_dtype
+        if (indices_type is not None) and selected_experts.dtype != indices_type:
+            selected_experts = selected_experts.to(dtype=indices_type)
+
+        assert selected_experts.dtype == indices_type or indices_type is None
 
         return xpu_fused_moe(
             hidden_states=x,

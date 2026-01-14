@@ -18,6 +18,13 @@ from torch.distributed import (
     get_global_rank,
 )
 
+from vllm.platforms import current_platform
+
+if current_platform.is_xpu():
+    torch.cuda.synchronize = torch.xpu.synchronize
+    torch.cuda.Stream = torch.xpu.Stream
+    torch.cuda.stream = torch.xpu.stream
+
 
 def idx_local_to_global(
     local_idx: int,

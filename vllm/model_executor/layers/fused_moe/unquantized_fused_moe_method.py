@@ -425,6 +425,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         else:
             raise ValueError("Invalid topk selection method.")
 
+        if layer.enable_eplb:
+            from vllm.model_executor.layers.fused_moe.fused_moe import (
+                eplb_map_to_physical_and_record,
+            )
+
+            selected_experts = eplb_map_to_physical_and_record(
+                topk_ids=selected_experts,
+                expert_load_view=layer.expert_load_view,
+                logical_to_physical_map=layer.logical_to_physical_map,
+                logical_replica_count=layer.logical_replica_count,
+            )
+
         return xpu_fused_moe(
             hidden_states=x,
             w13=layer.w13_weight,
