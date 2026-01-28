@@ -22,6 +22,15 @@ class XpuCommunicator(DeviceCommunicatorBase):
         unique_name: str = "",
     ):
         super().__init__(cpu_group, device, device_group, unique_name)
+ 
+        from vllm.config import get_current_vllm_config_or_none
+        config = get_current_vllm_config_or_none()
+
+        if config.parallel_config.enable_expert_parallel == False or \
+        config.parallel_config.tensor_parallel_size == 1:
+            #AgRs only support TP+DP+EP for this release
+            self.all2all_backend = "naive"
+
         if self.use_all2all:
             if self.all2all_backend == "naive":
                 from .all2all import NaiveAll2AllManager
