@@ -559,6 +559,8 @@ class VllmConfig:
             "external_launcher",
         )
 
+        from vllm.platforms import current_platform
+
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             if self.parallel_config.pipeline_parallel_size > 1:
@@ -587,7 +589,11 @@ class VllmConfig:
                 )
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
-            if self.parallel_config.pipeline_parallel_size > 1:
+            if current_platform.is_xpu():
+                # We disable async scheduling for xpu if use doesn't explicitly
+                # enable it.
+                self.scheduler_config.async_scheduling = False
+            elif self.parallel_config.pipeline_parallel_size > 1:
                 logger.warning_once(
                     "Async scheduling is not yet supported with "
                     "pipeline_parallel_size > 1 and will be disabled.",
@@ -642,8 +648,6 @@ class VllmConfig:
                 self.parallel_config.disable_nccl_for_dp_synchronization = True
             else:
                 self.parallel_config.disable_nccl_for_dp_synchronization = False
-
-        from vllm.platforms import current_platform
 
         if (
             self.model_config is not None
