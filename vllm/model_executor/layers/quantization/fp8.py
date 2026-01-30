@@ -606,7 +606,6 @@ class Fp8OnlineLinearMethod(Fp8LinearMethod):
                 )
                 _copy_missing_attrs(layer.weight, weight)
                 layer.register_parameter("weight", weight)
-                del layer._load_device
 
             # refresh the reference to `param` to reflect just-in-time
             # materialization
@@ -1215,7 +1214,6 @@ class Fp8OnlineMoEMethod(Fp8MoEMethod):
                 set_weight_attrs(w2_weight, extra_weight_attrs)
                 _copy_missing_attrs(layer.w2_weight, w2_weight)
                 layer.register_parameter("w2_weight", w2_weight)
-                del layer._load_device
 
             # refresh the reference to `param` to reflect just-in-time
             # materialization
