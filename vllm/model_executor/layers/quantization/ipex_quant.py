@@ -491,8 +491,12 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
             return
         if not self.quant_config.is_checkpoint_fp8_serialized:
             fp8_dtype = current_platform.fp8_dtype()
-            w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
-            w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
+            w13_weight = torch.empty_like(
+                layer.w13_weight.data, device="xpu", dtype=fp8_dtype
+            )
+            w2_weight = torch.empty_like(
+                layer.w2_weight.data, device="xpu", dtype=fp8_dtype
+            )
 
             # Re-initialize w13_scale because we directly quantize
             # merged w13 weights and generate a single scaling factor.
@@ -513,6 +517,8 @@ class XPUFp8MoEMethod(Fp8OnlineMoEMethod):
                 )
             replace_parameter(layer, "w13_weight", w13_weight)
             replace_parameter(layer, "w2_weight", w2_weight)
+            replace_parameter(layer, "w13_weight_scale", layer.w13_weight_scale)
+            replace_parameter(layer, "w2_weight_scale", layer.w2_weight_scale)
 
         import intel_extension_for_pytorch as ipex
 

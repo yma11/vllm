@@ -429,7 +429,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 ),
                 input_dim=1,
                 output_dim=0,
-                weight_loader=patched_weight_loader,
+                weight_loader=weight_loader,
             )
         layer.register_parameter("weight", weight)
 
@@ -1118,7 +1118,7 @@ class Fp8OnlineMoEMethod(Fp8MoEMethod):
         weight_loader = extra_weight_attrs["weight_loader"]
         # create a new holder to prevent modifying behavior of any other
         # objects which might depend on the old one
-        new_extra_weight_attrs = extra_weight_attrs
+        # new_extra_weight_attrs = extra_weight_attrs
 
         def patched_weight_loader(param, loaded_weight, *args, **kwargs):
             # add a counter to track how many elements we have updated
@@ -1144,9 +1144,6 @@ class Fp8OnlineMoEMethod(Fp8MoEMethod):
                 layer._already_called_process_weights_after_loading = True
 
             return res
-
-        new_extra_weight_attrs["weight_loader"] = patched_weight_loader
-        extra_weight_attrs = new_extra_weight_attrs
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
