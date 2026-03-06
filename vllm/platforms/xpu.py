@@ -12,6 +12,7 @@ import vllm_xpu_kernels._C  # noqa
 import vllm_xpu_kernels._moe_C  # noqa
 import vllm_xpu_kernels._xpu_C  # noqa
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import supports_xpu_graph
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -259,7 +260,15 @@ class XPUPlatform(Platform):
 
     @classmethod
     def fp8_dtype(cls) -> torch.dtype:
-        return torch.float8_e4m3fn
+        if envs.VLLM_XPU_FP8_DTYPE == "e4m3":
+            return torch.float8_e4m3fn
+        elif envs.VLLM_XPU_FP8_DTYPE == "e5m2":
+            return torch.float8_e5m2
+        else:
+            raise ValueError(
+                f"Unsupported XPU FP8 dtype: {envs.VLLM_XPU_FP8_DTYPE}. "
+                f"Supported values are 'e4m3' and 'e5m2'."
+            )
 
     @classmethod
     def is_data_center_gpu(cls) -> bool:
