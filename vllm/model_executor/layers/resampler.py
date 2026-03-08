@@ -242,7 +242,9 @@ class Resampler2(BaseResampler):
         pos_embed_arr = get_2d_sincos_pos_embed(embed_dim, grid_size, version=(2, 0))
 
         self.pos_embed = nn.Parameter(
-            torch.from_numpy(pos_embed_arr).requires_grad_(False)
+            torch.from_numpy(pos_embed_arr)
+            .to(device=self.query.device, dtype=self.query.dtype)
+            .requires_grad_(False)
         )
 
     def forward(

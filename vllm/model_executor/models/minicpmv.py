@@ -81,7 +81,6 @@ from vllm.multimodal.processing.processor import (
     ResolvedPromptUpdate,
     _seq2text,
 )
-from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import flatten_2d_lists
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
@@ -171,15 +170,22 @@ class Resampler2_5(BaseResampler):
         )
 
         self.max_size = max_size
-        self._set_2d_pos_cache(self.max_size)
+        self._set_2d_pos_cache(self.max_size, device=self.query.device)
 
     def _set_2d_pos_cache(
-        self, max_size: tuple[int, int], device: torch.types.Device = "cpu"
+        self,
+        max_size: tuple[int, int],
+        device: torch.types.Device | None = None,
     ) -> None:
+        if device is None:
+            device = self.query.device
         pos_embed_arr = get_2d_sincos_pos_embed(
             self.embed_dim, max_size, version=(2, 5)
         )
-        pos_embed = torch.from_numpy(pos_embed_arr).float().to(device)
+        pos_embed = torch.from_numpy(pos_embed_arr).to(
+            device=device,
+            dtype=self.query.dtype,
+        )
         self.register_buffer("pos_embed", pos_embed, persistent=False)
 
     def _adjust_pos_cache(
@@ -269,7 +275,10 @@ class Resampler4_5(Resampler2_5):
 
         trunc_normal_(self.query, std=0.02)
         self.max_temporal_size = max_temporal_size
-        self._set_temporal_pos_cache(self.max_temporal_size)
+        self._set_temporal_pos_cache(
+            self.max_temporal_size,
+            device=self.query.device,
+        )
         self.apply(self._init_weights)
 
     def get_1d_sincos_pos_embed_from_temporal_size(
@@ -295,22 +304,24 @@ class Resampler4_5(Resampler2_5):
         return emb
 
     def _set_temporal_pos_cache(
-        self, max_temporal_size: int, device: torch.types.Device = "cpu"
+        self,
+        max_temporal_size: int,
+        device: torch.types.Device | None = None,
     ) -> None:
+        if device is None:
+            device = self.query.device
         temporal_size = np.arange(max_temporal_size, dtype=np.float32)
-        pos_embed = (
-            torch.from_numpy(
-                self.get_1d_sincos_pos_embed_from_temporal_size(
-                    self.embed_dim, temporal_size
-                )
+        pos_embed = torch.from_numpy(
+            self.get_1d_sincos_pos_embed_from_temporal_size(
+                self.embed_dim, temporal_size
             )
-            .float()
-            .to(device)
-        )
+        ).to(device=device, dtype=self.query.dtype)
         self.register_buffer("temporal_pos_embed", pos_embed, persistent=False)
 
     def _adjust_temporal_pos_cache(
-        self, max_temporal_size: int, device: torch.types.Device = "cpu"
+        self,
+        max_temporal_size: int,
+        device: torch.types.Device | None = None,
     ):
         if max_temporal_size > self.max_temporal_size:
             self.max_temporal_size = max_temporal_size
@@ -1277,9 +1288,7 @@ class MiniCPMV2_0(MiniCPMVBaseModel):
                 prefix=prefix,
             )
 
-        return resampler.to(
-            device=current_platform.device_type, dtype=torch.get_default_dtype()
-        )
+        return resampler
 
     def get_vision_hidden_states(self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
         pixel_values = data["pixel_values"]
@@ -1360,9 +1369,7 @@ class MiniCPMV2_5(MiniCPMVBaseModel, SupportsLoRA):
                 prefix=prefix,
             )
 
-        return resampler.to(
-            device=current_platform.device_type, dtype=torch.get_default_dtype()
-        )
+        return resampler
 
     def get_vision_hidden_states(self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
         pixel_values = data["pixel_values"]
@@ -1454,9 +1461,7 @@ class MiniCPMV2_6(MiniCPMVBaseModel, SupportsLoRA):
                 prefix=prefix,
             )
 
-        return resampler.to(
-            device=current_platform.device_type, dtype=torch.get_default_dtype()
-        )
+        return resampler
 
     def get_vision_hidden_states(self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
         pixel_values = data["pixel_values"]
@@ -1552,9 +1557,7 @@ class MiniCPMV4_0(MiniCPMVBaseModel, SupportsLoRA):
                 prefix=prefix,
             )
 
-        return resampler.to(
-            device=current_platform.device_type, dtype=torch.get_default_dtype()
-        )
+        return resampler
 
     def get_vision_hidden_states(self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
         pixel_values = data["pixel_values"]
@@ -1650,9 +1653,7 @@ class MiniCPMV4_5(MiniCPMVBaseModel, SupportsLoRA):
                 prefix=prefix,
             )
 
-        return resampler.to(
-            device=current_platform.device_type, dtype=torch.get_default_dtype()
-        )
+        return resampler
 
     def get_vision_hidden_states(self, data: MiniCPMVImagePixelInputs) -> torch.Tensor:
         pixel_values = data["pixel_values"]
