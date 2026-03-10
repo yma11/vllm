@@ -56,7 +56,6 @@ launch_baseline() {
       -tp 1 \
       --block-size ${BLOCK_SIZE} \
       --gpu-memory-utilization 0.8 \
-      --disable-log-requests \
       --dtype float16 \
       --enforce-eager"
   echo ${BASELINE_BASE_CMD}      
@@ -83,7 +82,6 @@ launch_pd() {
       --dtype float16 \
       -tp 1 \
       --gpu-memory-utilization 0.8 \
-      --disable-log-requests \
       --kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_buffer_device\":\"cpu\"}'"
 
 
@@ -102,7 +100,6 @@ launch_pd() {
       -tp 1 \
       --dtype float16 \
       --gpu-memory-utilization 0.8 \
-      --disable-log-requests \
       --kv-transfer-config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_buffer_device\":\"cpu\"}'"
 
   echo ${PREFILL_BASE_CMD}
