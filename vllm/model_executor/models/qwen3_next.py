@@ -694,8 +694,11 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 self.conv1d.weight.size(0), self.conv1d.weight.size(2)
             )
 
-            self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-            conv_state = self_kv_cache[0]
+            # self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+            # conv_state = self_kv_cache[0]
+            # ssm_state = self_kv_cache[1]
+            self_kv_cache = self.kv_cache
+            conv_state = self_kv_cache[0].transpose(-1, -2)
             ssm_state = self_kv_cache[1]
 
             torch.ops._xpu_C.gdn_attention(
