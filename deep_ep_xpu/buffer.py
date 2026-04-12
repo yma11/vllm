@@ -1,3 +1,5 @@
+import warnings
+
 import torch
 import torch.distributed as dist
 from typing import List, Tuple, Optional, Union
@@ -12,7 +14,7 @@ from .utils import EventOverlap
 class Buffer:
     """
     The core expert-parallel (EP) communication buffers for Mixture of Experts (MoE) model, which supports:
-        - high-throughput intranode all-to-all (dispatch and combine using IPC, currently is supported)
+        - high-throughput intranode all-to-all (dispatch and combine using IPC)
 
     Attributes:
         num_eus: the EUs used in high-throughput kernels.
@@ -20,7 +22,7 @@ class Buffer:
         group_size: the number of ranks in the group.
         group: the communication group.
         num_ipc_bytes: the buffer size for intranode IPC communication.
-        num_rdma_bytes: the buffer size for internode (also for intranode with low-latency mode) RDMA communication.
+        num_rdma_bytes: the buffer size for internode RDMA communication (not yet supported on XPU).
         runtime: the C++ runtime.
     """
 
@@ -40,13 +42,11 @@ class Buffer:
         Arguments:
             group: the communication group.
             num_ipc_bytes: the buffer size for intranode IPC communication.
-            num_rdma_bytes: the buffer size for internode (also for intranode with low-latency mode) RDMA communication.
-            low_latency_mode: whether to enable low-latency mode, currently is not supported.
-            enable_shrink: whether to enable shrink mode. The enable mode allocates a mask buffer to support masking ranks dynamically.
-            explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
-                otherwise, the resources will be released by the destructor.
-                Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
-            comm: the `mpi4py.MPI.Comm` communicator to use in case the group parameter is absent.
+            num_rdma_bytes: the buffer size for internode RDMA communication (not yet supported on XPU).
+            low_latency_mode: whether to enable low-latency mode (not yet supported on XPU).
+            enable_shrink: whether to enable shrink mode.
+            explicitly_destroy: If True, you must explicitly call `destroy()` to release resources.
+            comm: the `mpi4py.MPI.Comm` communicator to use when group is absent.
         """
 
         if group is not None:
@@ -67,11 +67,13 @@ class Buffer:
                 return comm.allgather(obj)
         else:
             raise ValueError("Either 'group' or 'comm' must be provided.")
+
         self.num_ipc_bytes = num_ipc_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
+
         self.runtime = deep_ep_cpp.Buffer(
             self.rank,
             self.group_size,
@@ -81,22 +83,25 @@ class Buffer:
             explicitly_destroy,
             enable_shrink
         )
+
         # Synchronize device IDs
         local_device_id = self.runtime.get_local_device_id()
         device_ids = all_gather_object(local_device_id)
-        # Synchronize IPC handles
-        local_ipc_handle = self.runtime.get_local_ipc_handle()
 
+        # Synchronize IPC handles via Ring AllGather (Unix socket + SCM_RIGHTS fd passing)
+        local_ipc_handle = self.runtime.get_local_ipc_handle()
         if comm is not None:
             barrier_func = comm.Barrier
         else:
             barrier_func = lambda: dist.barrier(group=self.group)
-        # Perform barrier and gather IPC handles in Python to avoid relying on a non-exported C++ method.
-        barrier_func()
-        ipc_handles = all_gather_object(local_ipc_handle)
+        ipc_handles = self.runtime.all_gather_handle(local_ipc_handle, barrier_func)
 
+        # InterNode is not yet supported on XPU
         root_unique_id = None
-        # Make CPP runtime available
+        if self.runtime.get_num_rdma_ranks() > 1:
+            warnings.warn("InterNode communication is not yet supported on XPU. "
+                          "Only intranode IPC communication is available.")
+
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
 
@@ -167,18 +172,18 @@ class Buffer:
         # TODO: These config values are ported from the NVIDIA implementation and need to be
         # re-tuned for Intel XPU (PVC) architecture.
         config_map = {
-            2: Config(Buffer.num_eus, 24, 256, 6, 128),
-            4: Config(Buffer.num_eus, 6, 256, 6, 128),
-            8: Config(Buffer.num_eus, 6, 256, 6, 128),
-            16: Config(Buffer.num_eus, 36, 288, 20, 128),
-            24: Config(Buffer.num_eus, 32, 288, 8, 128),
-            32: Config(Buffer.num_eus, 32, 288, 8, 128),
-            48: Config(Buffer.num_eus, 32, 288, 8, 128),
-            64: Config(Buffer.num_eus, 32, 288, 8, 128),
-            96: Config(Buffer.num_eus, 20, 480, 12, 128),
-            128: Config(Buffer.num_eus, 20, 560, 12, 128),
-            144: Config(Buffer.num_eus, 32, 720, 12, 128),
-            160: Config(Buffer.num_eus, 28, 720, 12, 128),
+            2: Config(Buffer.num_eus, 24, 256, 0, 0),
+            4: Config(Buffer.num_eus, 6, 256, 0, 0),
+            8: Config(Buffer.num_eus, 6, 256, 0, 0),
+            16: Config(Buffer.num_eus, 36, 288, 0, 0),
+            24: Config(Buffer.num_eus, 32, 288, 0, 0),
+            32: Config(Buffer.num_eus, 32, 288, 0, 0),
+            48: Config(Buffer.num_eus, 32, 288, 0, 0),
+            64: Config(Buffer.num_eus, 32, 288, 0, 0),
+            96: Config(Buffer.num_eus, 20, 480, 0, 0),
+            128: Config(Buffer.num_eus, 20, 560, 0, 0),
+            144: Config(Buffer.num_eus, 32, 720, 0, 0),
+            160: Config(Buffer.num_eus, 28, 720, 0, 0),
         }
         assert num_ranks in config_map, f'Unsupported number of EP ranks: {num_ranks}'
         return config_map[num_ranks]
@@ -198,50 +203,22 @@ class Buffer:
         # TODO: These config values are ported from the NVIDIA implementation and need to be
         # re-tuned for Intel XPU.
         config_map = {
-            2: Config(Buffer.num_eus, 10, 256, 6, 128),
-            4: Config(Buffer.num_eus, 9, 256, 6, 128),
-            8: Config(Buffer.num_eus, 4, 256, 6, 128),
-            16: Config(Buffer.num_eus, 4, 288, 12, 128),
-            24: Config(Buffer.num_eus, 1, 288, 8, 128),
-            32: Config(Buffer.num_eus, 1, 288, 8, 128),
-            48: Config(Buffer.num_eus, 1, 288, 8, 128),
-            64: Config(Buffer.num_eus, 1, 288, 8, 128),
-            96: Config(Buffer.num_eus, 1, 480, 8, 128),
-            128: Config(Buffer.num_eus, 1, 560, 8, 128),
-            144: Config(Buffer.num_eus, 2, 720, 8, 128),
-            160: Config(Buffer.num_eus, 2, 720, 8, 128),
+            2: Config(Buffer.num_eus, 10, 256, 0, 0),
+            4: Config(Buffer.num_eus, 9, 256, 0, 0),
+            8: Config(Buffer.num_eus, 4, 256, 0, 0),
+            16: Config(Buffer.num_eus, 4, 288, 0, 0),
+            24: Config(Buffer.num_eus, 1, 288, 0, 0),
+            32: Config(Buffer.num_eus, 1, 288, 0, 0),
+            48: Config(Buffer.num_eus, 1, 288, 0, 0),
+            64: Config(Buffer.num_eus, 1, 288, 0, 0),
+            96: Config(Buffer.num_eus, 1, 480, 0, 0),
+            128: Config(Buffer.num_eus, 1, 560, 0, 0),
+            144: Config(Buffer.num_eus, 2, 720, 0, 0),
+            160: Config(Buffer.num_eus, 2, 720, 0, 0),
         }
         assert num_ranks in config_map, f'Unsupported number of EP ranks: {num_ranks}'
         return config_map[num_ranks]
 
-    # noinspection PyTypeChecker
-    def get_dispatch_layout(self, topk_idx: torch.Tensor, num_experts: int,
-                            previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                            allocate_on_comm_stream: bool = False) -> \
-            Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, EventOverlap]:
-        """
-        Calculate the layout required for later communication.
-
-        Arguments:
-            topk_idx: `[num_tokens, num_topk]`, dtype must be `deep_ep.topk_idx_t` (typically `torch.int64`), the expert
-                indices selected by each token, `-1` means no selections.
-            num_experts: the number of experts.
-            previous_event: the event to wait before actually executing the kernel.
-            async_finish: the current stream will not wait for the communication kernels to be finished if set.
-            allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
-
-        Returns:
-            num_tokens_per_rank: `[num_ranks]` with `torch.int`, the number of tokens to be sent to each rank.
-            num_tokens_per_rdma_rank: `[num_rdma_ranks]` with `torch.int`, the number of tokens to be sent to each RDMA
-                rank (with the same GPU index), return `None` for intranode settings.
-            num_tokens_per_expert: `[num_experts]` with `torch.int`, the number of tokens to be sent to each expert.
-            is_token_in_rank: `[num_tokens, num_ranks]` with `torch.bool`, whether a token be sent to a rank.
-            event: the event after executing the kernel (valid only if `async_finish` is set).
-        """
-        num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event = \
-            self.runtime.get_dispatch_layout(topk_idx, num_experts, getattr(previous_event, 'event', None),
-                                             async_finish, allocate_on_comm_stream)
-        return num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, EventOverlap(event)
 
     # noinspection PyTypeChecker
     def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
