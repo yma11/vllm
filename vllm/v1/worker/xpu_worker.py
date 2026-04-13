@@ -76,7 +76,8 @@ class XPUWorker(Worker):
         os.environ["CCL_ATL_TRANSPORT"] = ENV_CCL_ATL_TRANSPORT
         os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
         os.environ["LOCAL_RANK"] = str(self.local_rank)
-
+        os.environ["ZE_AFFINITY_MASK"] = str(self.local_rank)
+        print(f"!!!! set ZE_AFFINITY_MASK to {str(self.local_rank)}")
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,

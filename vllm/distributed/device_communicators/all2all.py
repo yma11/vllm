@@ -429,7 +429,8 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         import deep_ep  # type: ignore[import-not-found]
 
         buffer_kwargs = self._make_all2all_kwargs(**kwargs)
-        logger.debug("DeepEP all2all args %s", buffer_kwargs)
+        print("!!!!!DeepEP all2all args %s", buffer_kwargs)
+        buffer_kwargs.update({"num_nvl_bytes": 0})
         handle: deep_ep.Buffer = self.handle_cache.get_or_create(
             buffer_kwargs, deep_ep.Buffer
         )
