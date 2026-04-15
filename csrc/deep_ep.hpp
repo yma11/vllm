@@ -137,6 +137,11 @@ public:
     std::vector<std::optional<pybind11::bytearray>> all_gather_handle(
         const pybind11::bytearray& local_ipc_handle,
         const pybind11::function& barrier_func);
+
+    // Barrier test methods
+    void test_barrier(const std::optional<c10::intrusive_ptr<c10d::ProcessGroup>>& process_group = std::nullopt);
+    void test_barrier_perf(int inner_repeat);
+    int test_barrier_stress(int inner_repeat, int iter_offset, int data_size);
 };
 
 }  // namespace deep_ep

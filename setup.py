@@ -9,7 +9,7 @@ from setuptools import Extension
 
 if __name__ == '__main__':
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
-    sources = ['csrc/deep_ep.cpp']
+    sources = ['csrc/deep_ep.cpp', 'csrc/sycl/intranode.cpp']
     project_root = os.path.dirname(os.path.abspath(__file__))
     include_dirs = [os.path.join(project_root, 'csrc'), os.path.join(project_root, 'csrc', 'sycl')]
 

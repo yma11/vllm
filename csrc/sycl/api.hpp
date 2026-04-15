@@ -12,8 +12,25 @@ int init(const std::vector<uint8_t>& root_unique_id_val, int rank, int num_ranks
 void* alloc(size_t size, size_t alignment);
 void free(void* ptr);
 
-
 }  // namespace internode
 
+namespace intranode {
+
+void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::queue& stream);
+
+void barrier_perf_test(int** barrier_signal_ptrs,
+                       int rank, int num_ranks,
+                       int inner_repeat,
+                       sycl::queue& stream);
+
+void barrier_stress_test(void** buffer_ptrs,
+                         int** barrier_signal_ptrs,
+                         int* error_count,
+                         int rank, int num_ranks,
+                         int inner_repeat, int iter_offset,
+                         int data_size, int data_offset_ints,
+                         sycl::queue& stream);
+
+}  // namespace intranode
 
 }  // namespace deep_ep
