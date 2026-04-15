@@ -351,6 +351,7 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
 
         buffer_kwargs = self._make_all2all_kwargs()
         logger.debug("DeepEP all2all args %s", buffer_kwargs)
+        buffer_kwargs.update({"num_nvl_bytes": 0})
         handle: deep_ep.Buffer = self.handle_cache.get_or_create(
             buffer_kwargs, deep_ep.Buffer
         )
