@@ -294,7 +294,7 @@ def run_tests(args):
 
     buffer = deep_ep.Buffer(
         group, int(1e8), 0,
-        low_latency_mode=False, num_qps_per_rank=1,
+        low_latency_mode=False,
         comm=mpi_comm)
 
     mpi_comm.Barrier()
