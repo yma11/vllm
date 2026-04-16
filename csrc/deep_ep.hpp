@@ -138,6 +138,14 @@ public:
         const pybind11::bytearray& local_ipc_handle,
         const pybind11::function& barrier_func);
 
+    // Layout computation
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
+    get_dispatch_layout(const torch::Tensor& topk_idx,
+                        int num_experts,
+                        std::optional<EventHandle>& previous_event,
+                        bool async,
+                        bool allocate_on_comm_stream);
+
     // Barrier test methods
     void test_barrier(const std::optional<c10::intrusive_ptr<c10d::ProcessGroup>>& process_group = std::nullopt);
     void test_barrier_perf(int inner_repeat);

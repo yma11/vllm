@@ -9,6 +9,7 @@
 #include <memory>
 
 #include "sycl/api.hpp"
+#include "sycl/layout.hpp"
 #include <sycl/sycl.hpp>
 #include <level_zero/ze_api.h>
 #include "sycl/configs.h"
@@ -527,7 +528,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              "Barrier stress test with IPC data verification. Returns error count.")
         .def("test_barrier_perf", &deep_ep::Buffer::test_barrier_perf,
              py::arg("inner_repeat"),
-             "Pure barrier performance test (no data verification).");
+             "Pure barrier performance test (no data verification).")
+        .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout,
+             py::arg("topk_idx"),
+             py::arg("num_experts"),
+             py::arg("previous_event"),
+             py::arg("async_op") = false,
+             py::arg("allocate_on_comm_stream") = false,
+             "Compute dispatch layout: token distribution across experts and ranks.");
 }
 
 
@@ -546,7 +554,7 @@ int deep_ep::Buffer::test_barrier_stress(int inner_repeat, int iter_offset, int 
     EP_HOST_ASSERT(is_available() && "Buffer must be synced before calling test_barrier_stress");
     EP_HOST_ASSERT(data_size > 0 && "data_size must be positive");
 
-    // Use the tail of the NVL data buffer for stress test data
+    // Use the tail of the IPC data buffer for stress test data
     // data_offset_ints is the int-offset from the start of each rank's buffer
     int data_bytes = data_size * sizeof(int);
     EP_HOST_ASSERT(data_bytes <= num_ipc_bytes && "data_size too large for IPC buffer");
@@ -600,4 +608,34 @@ void deep_ep::Buffer::test_barrier(const std::optional<c10::intrusive_ptr<c10d::
     
     std::cout << "[test_barrier] Rank " << ipc_rank 
               << ": Barrier test completed." << std::endl;
+}
+
+
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<deep_ep::EventHandle>>
+deep_ep::Buffer::get_dispatch_layout(const torch::Tensor& topk_idx,
+                                     int num_experts,
+                                     std::optional<deep_ep::EventHandle>& previous_event,
+                                     bool async,
+                                     bool allocate_on_comm_stream) {
+    EP_HOST_ASSERT(topk_idx.dim() == 2);
+    EP_HOST_ASSERT(topk_idx.is_contiguous());
+    EP_HOST_ASSERT(num_experts > 0);
+
+    auto num_tokens = static_cast<int>(topk_idx.size(0)), num_topk = static_cast<int>(topk_idx.size(1));
+    auto num_tokens_per_rank = torch::empty({num_ranks}, torch::dtype(torch::kInt32).device(torch::kXPU));
+    auto num_tokens_per_rdma_rank = std::optional<torch::Tensor>();
+    auto num_tokens_per_expert = torch::empty({num_experts}, torch::dtype(torch::kInt32).device(torch::kXPU));
+    auto is_token_in_rank = torch::empty({num_tokens, num_ranks}, torch::dtype(torch::kBool).device(torch::kXPU));
+
+    deep_ep::layout::get_dispatch_layout(topk_idx.data_ptr<deep_ep::topk_idx_t>(),
+                                num_tokens_per_rank.data_ptr<int>(),
+                                nullptr,
+                                num_tokens_per_expert.data_ptr<int>(),
+                                is_token_in_rank.data_ptr<bool>(),
+                                num_tokens,
+                                num_topk,
+                                num_ranks,
+                                num_experts,
+                                comm_stream);
+    return std::make_tuple(num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, std::nullopt);
 }

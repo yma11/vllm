@@ -219,6 +219,35 @@ class Buffer:
         assert num_ranks in config_map, f'Unsupported number of EP ranks: {num_ranks}'
         return config_map[num_ranks]
 
+    def get_dispatch_layout(self,
+                            topk_idx: torch.Tensor,
+                            num_experts: int,
+                            previous_event: Optional[EventOverlap] = None,
+                            async_finish: bool = False,
+                            allocate_on_comm_stream: bool = False):
+        """
+        Compute the dispatch layout: token distribution across experts and ranks.
+
+        Arguments:
+            topk_idx: ``[num_tokens, num_topk]`` with ``deep_ep.topk_idx_t``, the expert indices
+                selected by each token, ``-1`` means no selection.
+            num_experts: the total number of experts.
+            previous_event: the event to wait before executing the kernel.
+            async_finish: if set, the current stream will not wait for the kernel to finish.
+            allocate_on_comm_stream: allocate output tensors on the communication stream.
+
+        Returns:
+            num_tokens_per_rank: ``[num_ranks]`` with ``torch.int32``.
+            num_tokens_per_rdma_rank: ``[num_rdma_ranks]`` with ``torch.int32`` or ``None``.
+            num_tokens_per_expert: ``[num_experts]`` with ``torch.int32``.
+            is_token_in_rank: ``[num_tokens, num_ranks]`` with ``torch.bool``.
+            event: the event after executing the kernel (valid only if ``async_finish`` is set).
+        """
+        prev = getattr(previous_event, 'event', None) if previous_event is not None else None
+        num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event = \
+            self.runtime.get_dispatch_layout(topk_idx, num_experts, prev, async_finish, allocate_on_comm_stream)
+        return num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, \
+            EventOverlap(event) if event is not None else None
 
     # noinspection PyTypeChecker
     def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
