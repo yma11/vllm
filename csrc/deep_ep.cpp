@@ -535,7 +535,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("previous_event"),
              py::arg("async_op") = false,
              py::arg("allocate_on_comm_stream") = false,
-             "Compute dispatch layout: token distribution across experts and ranks.");
+             "Compute dispatch layout: token distribution across experts and ranks.")
+        .def("test_notify_dispatch", &deep_ep::Buffer::test_notify_dispatch,
+             py::arg("num_tokens_per_rank"),
+             py::arg("num_tokens_per_expert"),
+             py::arg("is_token_in_rank"),
+             py::arg("num_tokens"),
+             py::arg("num_experts"),
+             py::arg("num_channels"),
+             py::arg("expert_alignment"),
+             "Test notify_dispatch kernel: exchange token counts and compute prefix matrices.");
 }
 
 
@@ -584,15 +593,11 @@ int deep_ep::Buffer::test_barrier_stress(int inner_repeat, int iter_offset, int 
 
 void deep_ep::Buffer::test_barrier(const std::optional<c10::intrusive_ptr<c10d::ProcessGroup>>& process_group) {
     EP_HOST_ASSERT(is_available() && "Buffer must be synced before calling test_barrier");
-    std::cout << "[test_barrier] Rank " << ipc_rank << "/" << num_ipc_ranks 
-              << ": Starting barrier test..." << std::endl;
     
     // CPU barrier before GPU barrier
     if (process_group.has_value()) {
-        std::cout << "[test_barrier] Rank " << ipc_rank << ": CPU barrier (before GPU)..." << std::endl;
         auto work = process_group.value()->barrier();
         work->wait();
-        std::cout << "[test_barrier] Rank " << ipc_rank << ": CPU barrier done." << std::endl;
     }
     
     // GPU barrier
@@ -600,14 +605,9 @@ void deep_ep::Buffer::test_barrier(const std::optional<c10::intrusive_ptr<c10d::
     
     // CPU barrier after GPU barrier
     if (process_group.has_value()) {
-        std::cout << "[test_barrier] Rank " << ipc_rank << ": CPU barrier (after GPU)..." << std::endl;
         auto work = process_group.value()->barrier();
         work->wait();
-        std::cout << "[test_barrier] Rank " << ipc_rank << ": CPU barrier done." << std::endl;
     }
-    
-    std::cout << "[test_barrier] Rank " << ipc_rank 
-              << ": Barrier test completed." << std::endl;
 }
 
 
@@ -638,4 +638,65 @@ deep_ep::Buffer::get_dispatch_layout(const torch::Tensor& topk_idx,
                                 num_experts,
                                 comm_stream);
     return std::make_tuple(num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, std::nullopt);
+}
+
+
+std::tuple<int, std::vector<int>, torch::Tensor, torch::Tensor> 
+deep_ep::Buffer::test_notify_dispatch(
+    const torch::Tensor& num_tokens_per_rank,
+    const torch::Tensor& num_tokens_per_expert,
+    const torch::Tensor& is_token_in_rank,
+    int num_tokens,
+    int num_experts,
+    int num_channels,
+    int expert_alignment) {
+    
+    EP_HOST_ASSERT(is_available() && "Buffer must be synced before calling test_notify_dispatch");
+    
+    // Validate inputs
+    EP_HOST_ASSERT(num_tokens_per_rank.dim() == 1 && num_tokens_per_rank.size(0) == num_ipc_ranks);
+    EP_HOST_ASSERT(num_tokens_per_expert.dim() == 1 && num_tokens_per_expert.size(0) == num_experts);
+    EP_HOST_ASSERT(is_token_in_rank.dim() == 2 && is_token_in_rank.size(0) == num_tokens && is_token_in_rank.size(1) == num_ipc_ranks);
+    
+    int num_local_experts = num_experts / num_ipc_ranks;
+    
+    // Allocate output tensors
+    auto rank_prefix_matrix = torch::empty({num_ipc_ranks, num_ipc_ranks}, torch::dtype(torch::kInt32).device(torch::kXPU));
+    auto channel_prefix_matrix = torch::empty({num_ipc_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kXPU));
+    
+    // Reset counters
+    *moe_recv_counter = -1;
+    for (int i = 0; i < num_local_experts; ++i)
+        moe_recv_expert_counter_mapped[i] = -1;
+    
+    // Calculate memset size
+    int num_memset_int = num_channels * num_ipc_ranks * 4;
+    
+    // Call notify_dispatch kernel (synchronous — stream.wait() inside)
+    intranode::notify_dispatch(
+        num_tokens_per_rank.data_ptr<int>(),
+        moe_recv_counter_mapped,
+        num_ipc_ranks,
+        num_tokens_per_expert.data_ptr<int>(),
+        moe_recv_expert_counter_mapped,
+        num_experts,
+        num_tokens,
+        is_token_in_rank.data_ptr<bool>(),
+        channel_prefix_matrix.data_ptr<int>(),
+        rank_prefix_matrix.data_ptr<int>(),
+        num_memset_int,
+        expert_alignment,
+        buffer_ptrs_gpu,
+        barrier_signal_ptrs_gpu,
+        ipc_rank,
+        comm_stream,
+        num_channels);
+    
+    // Read results (kernel is already synchronous, no polling needed)
+    int num_recv_tokens = static_cast<int>(*moe_recv_counter);
+    std::vector<int> expert_counts(num_local_experts);
+    for (int i = 0; i < num_local_experts; ++i)
+        expert_counts[i] = moe_recv_expert_counter_mapped[i];
+    
+    return std::make_tuple(num_recv_tokens, expert_counts, rank_prefix_matrix, channel_prefix_matrix);
 }

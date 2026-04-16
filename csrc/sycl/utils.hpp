@@ -99,3 +99,44 @@ SYCL_EXTERNAL inline void barrier_block_bypass(int** barrier_signal_ptrs, int ra
 
     item.barrier(sycl::access::fence_space::local_space);
 }
+
+template <typename T>
+SYCL_EXTERNAL inline T warp_reduce_sum(T value, sycl::nd_item<1>& item) {
+    auto sg = item.get_sub_group();
+    return sycl::reduce_over_group(sg, value, sycl::plus<T>());
+}
+
+template <typename T>
+SYCL_EXTERNAL inline T warp_reduce_max(T value, sycl::nd_item<1>& item) {
+    auto sg = item.get_sub_group();
+    return sycl::reduce_over_group(sg, value, sycl::maximum<T>());
+}
+
+template <typename T>
+SYCL_EXTERNAL inline T warp_reduce_min(T value, sycl::nd_item<1>& item) {
+    auto sg = item.get_sub_group();
+    return sycl::reduce_over_group(sg, value, sycl::minimum<T>());
+}
+
+SYCL_EXTERNAL inline bool elect_one_sync(sycl::nd_item<1>& item) {
+    auto sg = item.get_sub_group();
+    return sg.get_local_linear_id() == 0;
+}
+
+SYCL_EXTERNAL inline int get_lane_id(sycl::nd_item<1>& item) {
+    auto sg = item.get_sub_group();
+    return static_cast<int>(sg.get_local_linear_id());
+}
+
+template <typename dtype_t>
+inline constexpr dtype_t align_up(dtype_t a, dtype_t b) {
+    return ceil_div<dtype_t>(a, b) * b;
+}
+
+
+SYCL_EXTERNAL inline void get_channel_task_range(int num_tokens, int num_sms, int sm_id, 
+                                          int& token_start_idx, int& token_end_idx) {
+    int num_tokens_per_sm = ceil_div(num_tokens, num_sms);
+    token_start_idx = sycl::min(num_tokens_per_sm * sm_id, num_tokens);
+    token_end_idx = sycl::min(token_start_idx + num_tokens_per_sm, num_tokens);
+}

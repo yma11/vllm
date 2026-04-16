@@ -31,9 +31,10 @@ if __name__ == '__main__':
         sycl_link_args = ['-fsycl', '-lze_loader', '-lmpi']
         
         # Add Intel GPU specific optimization flags
-        # Both compile and link need the same target specification
-        sycl_compile_args.extend(['-fsycl-targets=spir64_gen', '-Xs', '-device pvc'])
-        sycl_link_args.extend(['-fsycl-targets=spir64_gen', '-Xs', '-device pvc'])
+        # Read target device from XPU_AOT_TARGETS env var, default to 'bmg'
+        aot_target = os.getenv('XPU_AOT_TARGETS', 'bmg')
+        sycl_compile_args.extend(['-fsycl-targets=spir64_gen', '-Xs', f'-device {aot_target}'])
+        sycl_link_args.extend(['-fsycl-targets=spir64_gen', '-Xs', f'-device {aot_target}'])
         
         # Add common compile flags (warning suppression only, -O3 already in sycl_compile_args)
         xpu_cxx_flags = [flag for flag in cxx_flags if flag.startswith('-Wno-')]

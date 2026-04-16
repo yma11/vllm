@@ -150,6 +150,16 @@ public:
     void test_barrier(const std::optional<c10::intrusive_ptr<c10d::ProcessGroup>>& process_group = std::nullopt);
     void test_barrier_perf(int inner_repeat);
     int test_barrier_stress(int inner_repeat, int iter_offset, int data_size);
+
+    // Notify dispatch test
+    std::tuple<int, std::vector<int>, torch::Tensor, torch::Tensor> test_notify_dispatch(
+        const torch::Tensor& num_tokens_per_rank,
+        const torch::Tensor& num_tokens_per_expert,
+        const torch::Tensor& is_token_in_rank,
+        int num_tokens,
+        int num_experts,
+        int num_channels,
+        int expert_alignment);
 };
 
 }  // namespace deep_ep
