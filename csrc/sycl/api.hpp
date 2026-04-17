@@ -49,6 +49,42 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      sycl::queue& stream,
                      int num_channels);
 
+void cached_notify_dispatch(const int* rank_prefix_matrix,
+                            int num_memset_int,
+                            void** buffer_ptrs,
+                            int** barrier_signal_ptrs,
+                            int rank,
+                            int num_ranks,
+                            sycl::queue& stream);
+
+void dispatch(void* recv_x,
+              float* recv_x_scales,
+              int* recv_src_idx,
+              topk_idx_t* recv_topk_idx,
+              float* recv_topk_weights,
+              int* recv_channel_offset,
+              int* send_head,
+              const void* x,
+              const float* x_scales,
+              const topk_idx_t* topk_idx,
+              const float* topk_weights,
+              const bool* is_token_in_rank,
+              const int* channel_prefix_matrix,
+              int num_tokens,
+              int num_worst_tokens,
+              int hidden_int4,
+              int num_topk,
+              int num_experts,
+              int num_scales,
+              int scale_token_stride,
+              int scale_hidden_stride,
+              void** buffer_ptrs,
+              int rank,
+              int num_ranks,
+              sycl::queue& stream,
+              int num_eus,
+              int num_max_send_tokens,
+              int num_recv_buffer_tokens);
 }  // namespace intranode
 
 }  // namespace deep_ep

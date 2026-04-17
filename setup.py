@@ -10,8 +10,7 @@ from setuptools import Extension
 if __name__ == '__main__':
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     sources = ['csrc/deep_ep.cpp', 'csrc/sycl/intranode.cpp', 'csrc/sycl/layout.cpp']
-    project_root = os.path.dirname(os.path.abspath(__file__))
-    include_dirs = [os.path.join(project_root, 'csrc'), os.path.join(project_root, 'csrc', 'sycl')]
+    include_dirs = ['csrc/']
 
     include_dirs.extend(torch.utils.cpp_extension.include_paths())
     # Summary
@@ -27,7 +26,7 @@ if __name__ == '__main__':
     try:
         subprocess.run([sycl_compiler, '--version'], check=True, capture_output=True)
         
-        sycl_compile_args = ['-fsycl', '-O3', '-DUSE_XPU', '-std=c++17']
+        sycl_compile_args = ['-fsycl', '-O3', '-DUSE_XPU', '-fsycl-default-sub-group-size=32']
         sycl_link_args = ['-fsycl', '-lze_loader', '-lmpi']
         
         # Add Intel GPU specific optimization flags
@@ -39,6 +38,7 @@ if __name__ == '__main__':
         # Add common compile flags (warning suppression only, -O3 already in sycl_compile_args)
         xpu_cxx_flags = [flag for flag in cxx_flags if flag.startswith('-Wno-')]
         sycl_compile_args.extend(xpu_cxx_flags)
+        sycl_compile_args.extend(['-DDISABLE_NVSHMEM', '-std=c++17'])
         
         torch_lib_path = os.path.join(os.path.dirname(torch.__file__), 'lib')
         

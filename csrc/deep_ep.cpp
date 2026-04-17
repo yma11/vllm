@@ -536,6 +536,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("async_op") = false,
              py::arg("allocate_on_comm_stream") = false,
              "Compute dispatch layout: token distribution across experts and ranks.")
+        .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch,
+             py::arg("x"),
+             py::arg("x_scales"),
+             py::arg("topk_idx"),
+             py::arg("topk_weights"),
+             py::arg("num_tokens_per_rank"),
+             py::arg("is_token_in_rank"),
+             py::arg("num_tokens_per_expert"),
+             py::arg("cached_num_recv_tokens"),
+             py::arg("cached_rank_prefix_matrix"),
+             py::arg("cached_channel_prefix_matrix"),
+             py::arg("expert_alignment"),
+             py::arg("num_worst_tokens"),
+             py::arg("config"),
+             py::arg("previous_event"),
+             py::arg("async_op") = false,
+             py::arg("allocate_on_comm_stream") = false)
         .def("test_notify_dispatch", &deep_ep::Buffer::test_notify_dispatch,
              py::arg("num_tokens_per_rank"),
              py::arg("num_tokens_per_expert"),
@@ -699,4 +716,262 @@ deep_ep::Buffer::test_notify_dispatch(
         expert_counts[i] = moe_recv_expert_counter_mapped[i];
     
     return std::make_tuple(num_recv_tokens, expert_counts, rank_prefix_matrix, channel_prefix_matrix);
+}
+
+std::tuple<torch::Tensor,
+           std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>,
+           std::vector<int>,
+           torch::Tensor,
+           torch::Tensor,
+           torch::Tensor,
+           torch::Tensor,
+           torch::Tensor,
+           std::optional<deep_ep::EventHandle>>
+deep_ep::Buffer::intranode_dispatch(const torch::Tensor& x,
+                                   const std::optional<torch::Tensor>& x_scales,
+                                   const std::optional<torch::Tensor>& topk_idx,
+                                   const std::optional<torch::Tensor>& topk_weights,
+                                   const std::optional<torch::Tensor>& num_tokens_per_rank,
+                                   const torch::Tensor& is_token_in_rank,
+                                   const std::optional<torch::Tensor>& num_tokens_per_expert,
+                                   int cached_num_recv_tokens,
+                                   const std::optional<torch::Tensor>& cached_rank_prefix_matrix,
+                                   const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
+                                   int expert_alignment,
+                                   int num_worst_tokens,
+                                   const deep_ep::Config& config,
+                                   std::optional<deep_ep::EventHandle>& previous_event,
+                                   bool async,
+                                   bool allocate_on_comm_stream) {
+    bool cached_mode = cached_rank_prefix_matrix.has_value();
+
+    // One channel uses two work-groups: even for sending, odd for receiving
+    EP_HOST_ASSERT(config.num_eus % 2 == 0);
+    int num_channels = config.num_eus / 2;
+    if (cached_mode) {
+        EP_HOST_ASSERT(cached_rank_prefix_matrix.has_value());
+        EP_HOST_ASSERT(cached_channel_prefix_matrix.has_value());
+    } else {
+        EP_HOST_ASSERT(num_tokens_per_rank.has_value());
+        EP_HOST_ASSERT(num_tokens_per_expert.has_value());
+    }
+
+    // Type checks
+    EP_HOST_ASSERT(is_token_in_rank.scalar_type() == torch::kBool);
+    if (cached_mode) {
+        EP_HOST_ASSERT(cached_rank_prefix_matrix->scalar_type() == torch::kInt32);
+        EP_HOST_ASSERT(cached_channel_prefix_matrix->scalar_type() == torch::kInt32);
+    } else {
+        EP_HOST_ASSERT(num_tokens_per_expert->scalar_type() == torch::kInt32);
+        EP_HOST_ASSERT(num_tokens_per_rank->scalar_type() == torch::kInt32);
+    }
+
+    // Shape and contiguous checks
+    EP_HOST_ASSERT(x.dim() == 2 && x.is_contiguous());
+    EP_HOST_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
+    EP_HOST_ASSERT(is_token_in_rank.dim() == 2 && is_token_in_rank.is_contiguous());
+    EP_HOST_ASSERT(is_token_in_rank.size(0) == x.size(0) && is_token_in_rank.size(1) == num_ranks);
+    if (cached_mode) {
+        EP_HOST_ASSERT(cached_rank_prefix_matrix->dim() == 2 && cached_rank_prefix_matrix->is_contiguous());
+        EP_HOST_ASSERT(cached_rank_prefix_matrix->size(0) == num_ranks && cached_rank_prefix_matrix->size(1) == num_ranks);
+        EP_HOST_ASSERT(cached_channel_prefix_matrix->dim() == 2 && cached_channel_prefix_matrix->is_contiguous());
+        EP_HOST_ASSERT(cached_channel_prefix_matrix->size(0) == num_ranks && cached_channel_prefix_matrix->size(1) == num_channels);
+    } else {
+        EP_HOST_ASSERT(num_tokens_per_expert->dim() == 1 && num_tokens_per_expert->is_contiguous());
+        EP_HOST_ASSERT(num_tokens_per_expert->size(0) % num_ranks == 0);
+        EP_HOST_ASSERT(num_tokens_per_expert->size(0) / num_ranks <= NUM_MAX_LOCAL_EXPERTS);
+        EP_HOST_ASSERT(num_tokens_per_rank->dim() == 1 && num_tokens_per_rank->is_contiguous());
+        EP_HOST_ASSERT(num_tokens_per_rank->size(0) == num_ranks);
+    }
+
+    auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
+    auto num_experts = cached_mode ? 0 : static_cast<int>(num_tokens_per_expert->size(0)), num_local_experts = num_experts / num_ranks;
+
+    // Top-k checks
+    int num_topk = 0;
+    topk_idx_t* topk_idx_ptr = nullptr;
+    float* topk_weights_ptr = nullptr;
+    EP_HOST_ASSERT(topk_idx.has_value() == topk_weights.has_value());
+    if (topk_idx.has_value()) {
+        num_topk = static_cast<int>(topk_idx->size(1));
+        EP_HOST_ASSERT(num_experts > 0);
+        EP_HOST_ASSERT(topk_idx->dim() == 2 && topk_idx->is_contiguous());
+        EP_HOST_ASSERT(topk_weights->dim() == 2 && topk_weights->is_contiguous());
+        EP_HOST_ASSERT(num_tokens == topk_idx->size(0) && num_tokens == topk_weights->size(0));
+        EP_HOST_ASSERT(num_topk == topk_weights->size(1));
+        EP_HOST_ASSERT(topk_weights->scalar_type() == torch::kFloat32);
+        topk_idx_ptr = topk_idx->data_ptr<topk_idx_t>();
+        topk_weights_ptr = topk_weights->data_ptr<float>();
+    }
+
+    // FP8 scales checks
+    float* x_scales_ptr = nullptr;
+    int num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
+    if (x_scales.has_value()) {
+        EP_HOST_ASSERT(x.element_size() == 1);
+        EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32 || x_scales->scalar_type() == torch::kInt);
+        EP_HOST_ASSERT(x_scales->dim() == 2);
+        EP_HOST_ASSERT(x_scales->size(0) == num_tokens);
+        num_scales = x_scales->dim() == 1 ? 1 : static_cast<int>(x_scales->size(1));
+        x_scales_ptr = static_cast<float*>(x_scales->data_ptr());
+        scale_token_stride = static_cast<int>(x_scales->stride(0));
+        scale_hidden_stride = static_cast<int>(x_scales->stride(1));
+    }
+
+    // Create handles (only return for non-cached mode)
+    int num_recv_tokens = -1;
+    auto rank_prefix_matrix = torch::Tensor();
+    auto channel_prefix_matrix = torch::Tensor();
+    std::vector<int> num_recv_tokens_per_expert_list;
+
+    // Barrier or send sizes
+    // To clean: channel start/end offset, head and tail
+    int num_memset_int = num_channels * num_ranks * 4;
+    if (cached_mode) {
+        num_recv_tokens = cached_num_recv_tokens;
+        rank_prefix_matrix = cached_rank_prefix_matrix.value();
+        channel_prefix_matrix = cached_channel_prefix_matrix.value();
+
+        // Copy rank prefix matrix and clean flags
+        intranode::cached_notify_dispatch(
+            rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, ipc_rank, num_ipc_ranks, comm_stream);
+    } else {
+        rank_prefix_matrix = torch::empty({num_ranks, num_ranks}, torch::dtype(torch::kInt32).device(torch::kXPU));
+        channel_prefix_matrix = torch::empty({num_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kXPU));
+
+        // Send sizes
+        // Meta information:
+        //  - Size prefix by ranks, shaped as `[num_ranks, num_ranks]`
+        //  - Size prefix by experts (not used later), shaped as `[num_ranks, num_local_experts]`
+        *moe_recv_counter = -1;
+        for (int i = 0; i < num_local_experts; ++i)
+            moe_recv_expert_counter_mapped[i] = -1;
+        EP_HOST_ASSERT(num_ranks * (num_ranks + num_local_experts) * sizeof(int) <= num_ipc_bytes);
+        intranode::notify_dispatch(num_tokens_per_rank->data_ptr<int>(),
+                                   moe_recv_counter_mapped,
+                                   num_ipc_ranks,
+                                   num_tokens_per_expert->data_ptr<int>(),
+                                   moe_recv_expert_counter_mapped,
+                                   num_experts,
+                                   num_tokens,
+                                   is_token_in_rank.data_ptr<bool>(),
+                                   channel_prefix_matrix.data_ptr<int>(),
+                                   rank_prefix_matrix.data_ptr<int>(),
+                                   num_memset_int,
+                                   expert_alignment,
+                                   buffer_ptrs_gpu,
+                                   barrier_signal_ptrs_gpu,
+                                   ipc_rank,
+                                   comm_stream,
+                                   num_channels);
+
+        if (num_worst_tokens > 0) {
+            // No CPU sync, just allocate the worst case
+            num_recv_tokens = num_worst_tokens;
+
+            // Must be forward with top-k stuffs
+            EP_HOST_ASSERT(topk_idx.has_value());
+            EP_HOST_ASSERT(topk_weights.has_value());
+        } else {
+            // Synchronize total received tokens and tokens per expert
+            while (true) {
+                // Read total count
+                num_recv_tokens = static_cast<int>(*moe_recv_counter);
+
+                // Read per-expert count
+                bool ready = (num_recv_tokens >= 0);
+                for (int i = 0; i < num_local_experts && ready; ++i)
+                    ready &= moe_recv_expert_counter_mapped[i] >= 0;
+
+                if (ready)
+                    break;
+            }
+            num_recv_tokens_per_expert_list = std::vector<int>(moe_recv_expert_counter_mapped, moe_recv_expert_counter_mapped + num_local_experts);
+        }
+    }
+
+    // Allocate new tensors
+    auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+    auto recv_src_idx = torch::empty({num_recv_tokens}, torch::dtype(torch::kInt32).device(torch::kXPU));
+    auto recv_topk_idx = std::optional<torch::Tensor>(), recv_topk_weights = std::optional<torch::Tensor>(),
+         recv_x_scales = std::optional<torch::Tensor>();
+    auto recv_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kXPU));
+    auto send_head = torch::empty({num_tokens, num_ranks}, torch::dtype(torch::kInt32).device(torch::kXPU));
+
+    // Assign pointers
+    topk_idx_t* recv_topk_idx_ptr = nullptr;
+    float* recv_topk_weights_ptr = nullptr;
+    float* recv_x_scales_ptr = nullptr;
+    if (topk_idx.has_value()) {
+        recv_topk_idx = torch::empty({num_recv_tokens, num_topk}, topk_idx->options());
+        recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
+        recv_topk_idx_ptr = recv_topk_idx->data_ptr<topk_idx_t>();
+        recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
+    }
+    if (x_scales.has_value()) {
+        recv_x_scales = x_scales->dim() == 1 ? torch::empty({num_recv_tokens}, x_scales->options())
+                                             : torch::empty({num_recv_tokens, num_scales}, x_scales->options());
+        recv_x_scales_ptr = static_cast<float*>(recv_x_scales->data_ptr());
+    }
+
+    // Dispatch
+    EP_HOST_ASSERT(
+        num_ranks * num_ranks * sizeof(int) +                                                                     // Size prefix matrix
+            num_channels * num_ranks * sizeof(int) +                                                              // Channel start offset
+            num_channels * num_ranks * sizeof(int) +                                                              // Channel end offset
+            num_channels * num_ranks * sizeof(int) * 2 +                                                          // Queue head and tail
+            num_channels * num_ranks * config.num_max_ipc_chunked_recv_tokens * hidden * recv_x.element_size() +  // Data buffer
+            num_channels * num_ranks * config.num_max_ipc_chunked_recv_tokens * sizeof(int) +                     // Source index buffer
+            num_channels * num_ranks * config.num_max_ipc_chunked_recv_tokens * num_topk * sizeof(topk_idx_t) +   // Top-k index buffer
+            num_channels * num_ranks * config.num_max_ipc_chunked_recv_tokens * num_topk * sizeof(float) +        // Top-k weight buffer
+            num_channels * num_ranks * config.num_max_ipc_chunked_recv_tokens * sizeof(float) * num_scales        // FP8 scale buffer
+        <= num_ipc_bytes);
+    intranode::dispatch(recv_x.data_ptr(),
+                        recv_x_scales_ptr,
+                        recv_src_idx.data_ptr<int>(),
+                        recv_topk_idx_ptr,
+                        recv_topk_weights_ptr,
+                        recv_channel_prefix_matrix.data_ptr<int>(),
+                        send_head.data_ptr<int>(),
+                        x.data_ptr(),
+                        x_scales_ptr,
+                        topk_idx_ptr,
+                        topk_weights_ptr,
+                        is_token_in_rank.data_ptr<bool>(),
+                        channel_prefix_matrix.data_ptr<int>(),
+                        num_tokens,
+                        num_worst_tokens,
+                        static_cast<int>(hidden * recv_x.element_size() / sizeof(int4)),
+                        num_topk,
+                        num_experts,
+                        num_scales,
+                        scale_token_stride,
+                        scale_hidden_stride,
+                        buffer_ptrs_gpu,
+                        ipc_rank,
+                        num_ipc_ranks,
+                        comm_stream,
+                        config.num_eus,
+                        config.num_max_ipc_chunked_send_tokens,
+                        config.num_max_ipc_chunked_recv_tokens);
+
+    // Wait for completion if not async
+    if (!async) {
+        comm_stream.wait();
+    }
+
+    // Return values
+    return {recv_x,
+            recv_x_scales,
+            recv_topk_idx,
+            recv_topk_weights,
+            num_recv_tokens_per_expert_list,
+            rank_prefix_matrix,
+            channel_prefix_matrix,
+            recv_channel_prefix_matrix,
+            recv_src_idx,
+            send_head,
+            std::nullopt};
 }

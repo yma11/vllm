@@ -134,9 +134,156 @@ inline constexpr dtype_t align_up(dtype_t a, dtype_t b) {
 }
 
 
-SYCL_EXTERNAL inline void get_channel_task_range(int num_tokens, int num_sms, int sm_id, 
+SYCL_EXTERNAL inline void get_channel_task_range(int num_tokens, int num_eus, int eu_id, 
                                           int& token_start_idx, int& token_end_idx) {
-    int num_tokens_per_sm = ceil_div(num_tokens, num_sms);
-    token_start_idx = sycl::min(num_tokens_per_sm * sm_id, num_tokens);
-    token_end_idx = sycl::min(token_start_idx + num_tokens_per_sm, num_tokens);
+    int num_tokens_per_eu = ceil_div(num_tokens, num_eus);
+    token_start_idx = sycl::min(num_tokens_per_eu * eu_id, num_tokens);
+    token_end_idx = sycl::min(token_start_idx + num_tokens_per_eu, num_tokens);
+}
+
+template <typename T>
+SYCL_EXTERNAL inline T ld_nc_global(const T* ptr) {
+#ifdef __SYCL_DEVICE_ONLY__
+    // IPC cross-GPU reads must bypass cache (LSC uncached)
+    // Use d64 when possible to halve PCIe transactions
+    static_assert(sizeof(T) % sizeof(int) == 0, "ld_nc_global requires sizeof(T) divisible by 4");
+    constexpr int N = sizeof(T) / sizeof(int);
+    if constexpr (N >= 2 && N % 2 == 0) {
+        constexpr int N64 = N / 2;
+        union { T val; int64_t i64s[N64]; } u;
+        const int64_t* p = reinterpret_cast<const int64_t*>(ptr);
+        #pragma unroll
+        for (int i = 0; i < N64; ++i) {
+            int64_t tmp;
+            asm volatile(
+                "lsc_load.ugm.uc.uc (M1, 32) %0:d64 flat[%1]:a64"
+                : "=rw"(tmp) : "rw"(p + i)
+            );
+            u.i64s[i] = tmp;
+        }
+        return u.val;
+    } else {
+        union { T val; int ints[N]; } u;
+        const int* p = reinterpret_cast<const int*>(ptr);
+        #pragma unroll
+        for (int i = 0; i < N; ++i) {
+            int tmp;
+            asm volatile(
+                "lsc_load.ugm.uc.uc (M1, 32) %0:d32 flat[%1]:a64"
+                : "=rw"(tmp) : "rw"(p + i)
+            );
+            u.ints[i] = tmp;
+        }
+        return u.val;
+    }
+#else
+    return *ptr;
+#endif
+}
+
+template <typename T>
+SYCL_EXTERNAL inline void st_na_global(T* ptr, T value) {
+#ifdef __SYCL_DEVICE_ONLY__
+    // IPC cross-GPU writes must bypass cache (LSC uncached)
+    // Use d64 when possible to halve PCIe transactions
+    static_assert(sizeof(T) % sizeof(int) == 0, "st_na_global requires sizeof(T) divisible by 4");
+    constexpr int N = sizeof(T) / sizeof(int);
+    if constexpr (N >= 2 && N % 2 == 0) {
+        constexpr int N64 = N / 2;
+        union { T val; int64_t i64s[N64]; } u;
+        u.val = value;
+        int64_t* p = reinterpret_cast<int64_t*>(ptr);
+        #pragma unroll
+        for (int i = 0; i < N64; ++i) {
+            asm volatile(
+                "lsc_store.ugm.uc.uc (M1, 32) flat[%0]:a64 %1:d64"
+                : : "rw"(p + i), "rw"(u.i64s[i]) : "memory"
+            );
+        }
+    } else {
+        union { T val; int ints[N]; } u;
+        u.val = value;
+        int* p = reinterpret_cast<int*>(ptr);
+        #pragma unroll
+        for (int i = 0; i < N; ++i) {
+            asm volatile(
+                "lsc_store.ugm.uc.uc (M1, 32) flat[%0]:a64 %1:d32"
+                : : "rw"(p + i), "rw"(u.ints[i]) : "memory"
+            );
+        }
+    }
+#else
+    *ptr = value;
+#endif
+}
+
+// d32x4 vector store — single LSC instruction for 16 bytes per lane
+template <typename T>
+SYCL_EXTERNAL inline void st_na_global_v(T* ptr, T value) {
+#ifdef __SYCL_DEVICE_ONLY__
+    static_assert(sizeof(T) == 16, "st_na_global_v requires sizeof(T) == 16");
+    using vec4_t = typename sycl::vec<uint32_t, 4>::vector_t;
+    vec4_t tmp;
+    __builtin_memcpy(&tmp, &value, 16);
+    auto* addr = reinterpret_cast<void*>(ptr);
+    asm volatile(
+        "lsc_store.ugm.uc.uc (M1, 32) flat[%0]:a64 %1:d32x4"
+        : : "rw"(addr), "rw"(tmp) : "memory"
+    );
+#else
+    *ptr = value;
+#endif
+}
+
+// d32x4 vector load — single LSC instruction for 16 bytes per lane (vs 2x d64)
+// Only for 16-byte types (e.g. int4 = 4x int32)
+template <typename T>
+SYCL_EXTERNAL inline T ld_nc_global_v(const T* ptr) {
+#ifdef __SYCL_DEVICE_ONLY__
+    static_assert(sizeof(T) == 16, "ld_nc_global_v requires sizeof(T) == 16");
+    using vec4_t = typename sycl::vec<uint32_t, 4>::vector_t;
+    vec4_t tmp;
+    auto* addr = reinterpret_cast<const void*>(ptr);
+    asm volatile(
+        "lsc_load.ugm.uc.uc (M1, 32) %0:d32x4 flat[%1]:a64"
+        : "=rw"(tmp) : "rw"(addr)
+    );
+    T result;
+    __builtin_memcpy(&result, &tmp, 16);
+    return result;
+#else
+    return *ptr;
+#endif
+}
+
+#define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC, ST_FUNC)                                                     \
+    {                                                                                                                                 \
+        constexpr int kLoopStride = 32 * (UNROLL_FACTOR);                                                                             \
+        typename std::remove_reference<decltype(LD_FUNC((SRC) + 0))>::type unrolled_values[(UNROLL_FACTOR)];                          \
+        auto __src = (SRC);                                                                                                           \
+        auto __dst = (DST);                                                                                                           \
+        for (int __i = (LANE_ID); __i < ((N) / kLoopStride) * kLoopStride; __i += kLoopStride) {                                      \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) unrolled_values[__j] = LD_FUNC(__src + __i + __j * 32); \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) ST_FUNC(__dst + __i + __j * 32, unrolled_values[__j]);  \
+        }                                                                                                                             \
+        {                                                                                                                             \
+            int __i = ((N) / kLoopStride) * kLoopStride + (LANE_ID);                                                                  \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) {                                                       \
+                if (__i + __j * 32 < (N)) {                                                                                           \
+                    unrolled_values[__j] = LD_FUNC(__src + __i + __j * 32);                                                           \
+                }                                                                                                                     \
+            }                                                                                                                         \
+            _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) {                                                       \
+                if (__i + __j * 32 < (N)) {                                                                                           \
+                    ST_FUNC(__dst + __i + __j * 32, unrolled_values[__j]);                                                            \
+                }                                                                                                                     \
+            }                                                                                                                         \
+        }                                                                                                                             \
+    }
+
+
+template <typename T>
+SYCL_EXTERNAL inline T warp_broadcast(T value, int src_lane, sycl::nd_item<1>& item) {
+    auto sg = item.get_sub_group();
+    return sycl::group_broadcast(sg, value, src_lane);
 }
