@@ -9,9 +9,12 @@ Modes:
 Optional --verify: run write→barrier→verify data correctness check first
 
 Example commands:
+    # mpirun (default, DEEPEP_LAUNCHER=mpi)
     mpirun -np 2 python tests/test_xpu_barrier_stress.py --use-mpi --inner-repeat 1000 --output perf
     mpirun -np 2 python tests/test_xpu_barrier_stress.py --use-mpi --inner-repeat 1000 --output perf --verify
     mpirun -np 2 python tests/test_xpu_barrier_stress.py --use-mpi --inner-repeat 10 --output profile --trace-dir ./traces
+    # torchrun (set DEEPEP_LAUNCHER=torchrun)
+    DEEPEP_LAUNCHER=torchrun torchrun --nproc_per_node=4 tests/test_xpu_barrier_stress.py --inner-repeat 100 --output perf
 """
 
 import argparse
@@ -20,15 +23,21 @@ import time
 import torch
 import torch.distributed as dist
 
-try:
-    from mpi4py import MPI
-    HAS_MPI = True
-except ImportError:
-    HAS_MPI = False
-    MPI = None
-
 os.environ['USE_XPU'] = '1'
 os.environ['USE_CUDA'] = '0'
+
+LAUNCHER = os.environ.get('DEEPEP_LAUNCHER', 'mpi').lower()
+
+if LAUNCHER == 'mpi':
+    try:
+        from mpi4py import MPI
+        HAS_MPI = True
+    except ImportError:
+        HAS_MPI = False
+        MPI = None
+else:
+    HAS_MPI = False
+    MPI = None
 
 
 def init_dist_mpi(port: int = 29500):
@@ -60,6 +69,20 @@ def init_dist_mpi(port: int = 29500):
     return rank, world_size, group, device, comm
 
 
+def init_dist_torchrun():
+    rank = int(os.environ['RANK'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+
+    torch.xpu.set_device(local_rank)
+    device = f'xpu:{local_rank}'
+
+    dist.init_process_group(backend='xccl')
+
+    group = dist.new_group(list(range(world_size)))
+    return rank, world_size, group, device
+
+
 def test_loop(args):
     import sys
     from pathlib import Path
@@ -75,7 +98,11 @@ def test_loop(args):
         assert args.outer_repeat == 1, \
             f"--outer-repeat must be 1 in profile mode (got {args.outer_repeat})"
 
-    rank, num_ranks, group, device, mpi_comm = init_dist_mpi(args.port)
+    if LAUNCHER == 'torchrun':
+        rank, num_ranks, group, device = init_dist_torchrun()
+        mpi_comm = None
+    else:
+        rank, num_ranks, group, device, mpi_comm = init_dist_mpi(args.port)
 
     if rank == 0:
         print(f"\n{'#'*60}")
@@ -86,17 +113,25 @@ def test_loop(args):
         print(f"# output={output}, verify={args.verify}")
         print(f"{'#'*60}\n")
 
-    buffer = deep_ep.Buffer(
-        group, int(1e8), 0,
-        low_latency_mode=False,
-        comm=mpi_comm)
+    if mpi_comm is not None:
+        buffer = deep_ep.Buffer(
+            group, int(1e8), 0,
+            low_latency_mode=False,
+            comm=mpi_comm)
+    else:
+        buffer = deep_ep.Buffer(
+            group, int(1e8), 0,
+            low_latency_mode=False)
     if rank == 0:
-        print(f"[Info] Buffer created")
+        print(f"[Info] Buffer created (launcher={LAUNCHER})")
 
     dist.barrier(group=group)
 
     def cpu_barrier():
-        mpi_comm.Barrier()
+        if mpi_comm is not None:
+            mpi_comm.Barrier()
+        else:
+            dist.barrier(group=group)
 
     try:
         # === Phase 1: verify (optional) ===
@@ -213,8 +248,8 @@ def main():
     parser.add_argument('--use-mpi', action='store_true')
     args = parser.parse_args()
 
-    if not HAS_MPI:
-        print("Error: mpi4py not installed")
+    if LAUNCHER == 'mpi' and not HAS_MPI:
+        print("Error: mpi4py not installed (set DEEPEP_LAUNCHER=torchrun to use torchrun)")
         return
     test_loop(args)
 

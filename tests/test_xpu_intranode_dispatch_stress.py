@@ -7,9 +7,12 @@ Encoding: each token's hidden dimensions are filled with rank * 1000000 + token_
 After dispatch, (src_rank, token_id) can be exactly decoded with zero precision loss.
 
 Usage:
+    # mpirun (default, DEEPEP_LAUNCHER=mpi)
     mpirun -np 2 python tests/test_xpu_intranode_dispatch_stress.py
     mpirun -np 4 python tests/test_xpu_intranode_dispatch_stress.py --num-tokens 32
-    mpirun -np 2 python tests/test_xpu_intranode_dispatch_stress.py --repeat 10
+    # torchrun (set DEEPEP_LAUNCHER=torchrun)
+    DEEPEP_LAUNCHER=torchrun torchrun --nproc_per_node=4 tests/test_xpu_intranode_dispatch_stress.py
+    DEEPEP_LAUNCHER=torchrun torchrun --nproc_per_node=4 tests/test_xpu_intranode_dispatch_stress.py --num-tokens 32 --repeat 10
 """
 
 import argparse
@@ -28,7 +31,10 @@ import torch.distributed as dist
 os.environ['USE_XPU'] = '1'
 os.environ['USE_CUDA'] = '0'
 
-from mpi4py import MPI
+LAUNCHER = os.environ.get('DEEPEP_LAUNCHER', 'mpi').lower()
+
+if LAUNCHER == 'mpi':
+    from mpi4py import MPI
 
 
 def init_dist_mpi(port: int = 29500):
@@ -51,6 +57,17 @@ def init_dist_mpi(port: int = 29500):
         rank=rank
     )
 
+    group = dist.new_group(list(range(world_size)))
+    return rank, world_size, group, device
+
+
+def init_dist_torchrun():
+    rank = int(os.environ['RANK'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    torch.xpu.set_device(local_rank)
+    device = f'xpu:{local_rank}'
+    dist.init_process_group(backend='xccl')
     group = dist.new_group(list(range(world_size)))
     return rank, world_size, group, device
 
@@ -276,8 +293,10 @@ def main():
 
     import deep_ep_xpu as deep_ep
 
-    rank, num_ranks, group, device = init_dist_mpi(port=args.port)
-    comm = MPI.COMM_WORLD
+    if LAUNCHER == 'torchrun':
+        rank, num_ranks, group, device = init_dist_torchrun()
+    else:
+        rank, num_ranks, group, device = init_dist_mpi(port=args.port)
 
     assert args.num_experts % num_ranks == 0, \
         f"num_experts ({args.num_experts}) must be divisible by num_ranks ({num_ranks})"
@@ -289,7 +308,6 @@ def main():
               f'repeat={args.repeat}, warmup={args.warmup}', flush=True)
         print(f'[config] dtype=int32 (exact verification, no precision loss)', flush=True)
 
-    mpi_comm = MPI.COMM_WORLD
     buffer = deep_ep.Buffer(group, int(1e9), 0, low_latency_mode=False)
 
     # Build routing tables (shared across all iterations)
@@ -368,7 +386,7 @@ def main():
         torch.xpu.synchronize()
 
     if args.profile:
-        comm.Barrier()
+        dist.barrier(group=group)
 
     # Test iterations
     total_errors = 0
@@ -399,7 +417,7 @@ def main():
 
     # Summary
     torch.xpu.synchronize()
-    comm.Barrier()
+    dist.barrier(group=group)
 
     if times_ms:
         avg_ms = sum(times_ms) / len(times_ms)
@@ -408,7 +426,9 @@ def main():
         print(f'[rank {rank}] {args.repeat} iters: avg={avg_ms:.3f}ms min={min_ms:.3f}ms '
               f'max={max_ms:.3f}ms errors={total_errors}', flush=True)
 
-    all_passed = comm.allreduce(all_passed_local, op=MPI.LAND)
+    passed_tensor = torch.tensor([int(all_passed_local)], dtype=torch.int32, device=device)
+    dist.all_reduce(passed_tensor, op=dist.ReduceOp.MIN)
+    all_passed = bool(passed_tensor.item())
 
     if rank == 0:
         if all_passed:
@@ -421,7 +441,6 @@ def main():
     except Exception:
         pass
 
-    comm.Barrier()
     if not all_passed:
         sys.exit(1)
 

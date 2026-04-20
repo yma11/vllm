@@ -7,13 +7,15 @@ Modes:
   profile:  Capture JSON trace via torch.profiler
 
 Commands:
+    # mpirun (default, DEEPEP_LAUNCHER=mpi)
     mpirun -np 2 python tests/test_xpu_notify_dispatch_stress.py --mode verify
     mpirun -np 2 python tests/test_xpu_notify_dispatch_stress.py --mode verify \
         --num-tokens 128 --num-topk 4 --num-experts 16
     mpirun -np 2 python tests/test_xpu_notify_dispatch_stress.py --mode perf \
         --inner-repeat 100 --warmup 10
-    mpirun -np 2 python tests/test_xpu_notify_dispatch_stress.py --mode profile \
-        --inner-repeat 10 --trace-dir ./nd_traces
+    # torchrun (set DEEPEP_LAUNCHER=torchrun)
+    DEEPEP_LAUNCHER=torchrun torchrun --nproc_per_node=4 tests/test_xpu_notify_dispatch_stress.py --mode verify
+    DEEPEP_LAUNCHER=torchrun torchrun --nproc_per_node=4 tests/test_xpu_notify_dispatch_stress.py --mode perf --inner-repeat 100
 """
 
 import argparse
@@ -24,7 +26,10 @@ import torch
 import torch.distributed as dist
 from contextlib import contextmanager
 
-from mpi4py import MPI
+LAUNCHER = os.environ.get('DEEPEP_LAUNCHER', 'mpi').lower()
+
+if LAUNCHER == 'mpi':
+    from mpi4py import MPI
 
 os.environ.setdefault('USE_XPU', '1')
 os.environ.setdefault('USE_CUDA', '0')
@@ -53,7 +58,18 @@ def init_dist_mpi(port: int = 29500):
             init_method=f'tcp://{os.environ["MASTER_ADDR"]}:{port}',
             world_size=world_size, rank=rank)
     group = dist.new_group(list(range(world_size)))
-    return rank, world_size, group, device, comm
+    return rank, world_size, group, device
+
+
+def init_dist_torchrun():
+    rank = int(os.environ['RANK'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    torch.xpu.set_device(local_rank)
+    device = f'xpu:{local_rank}'
+    dist.init_process_group(backend='xccl')
+    group = dist.new_group(list(range(world_size)))
+    return rank, world_size, group, device
 
 
 # ─── Utility functions ────────────────────────────────────────
@@ -91,9 +107,16 @@ def suppress_cpp_stdout():
 # ─── Python reference implementation ─────────────────────────────────────
 
 
+def allgather_object(obj, group, num_ranks):
+    """Allgather a Python object using torch.distributed (works with any launcher)"""
+    result = [None] * num_ranks
+    dist.all_gather_object(result, obj, group)
+    return result
+
+
 def reference_notify_dispatch(num_tokens_per_rank_cpu, num_tokens_per_expert_cpu,
                               is_token_in_rank_cpu, num_ranks, num_experts,
-                              num_channels, expert_alignment, rank, mpi_comm):
+                              num_channels, expert_alignment, rank, group):
     """
     Python reference implementation. Uses MPI allgather to collect data from
     all ranks and compute expected results.
@@ -102,7 +125,7 @@ def reference_notify_dispatch(num_tokens_per_rank_cpu, num_tokens_per_expert_cpu
     """
     # 1. allgather per-rank counts
     local_per_rank = num_tokens_per_rank_cpu.tolist()
-    all_per_rank = mpi_comm.allgather(local_per_rank)
+    all_per_rank = allgather_object(local_per_rank, group, num_ranks)
     # all_per_rank[src][dst] = tokens from src to dst
 
     # 2. moe_recv_count
@@ -118,7 +141,7 @@ def reference_notify_dispatch(num_tokens_per_rank_cpu, num_tokens_per_expert_cpu
     # 4. expert_counts (with alignment)
     epr = num_experts // num_ranks
     local_per_expert = num_tokens_per_expert_cpu.tolist()
-    all_per_expert = mpi_comm.allgather(local_per_expert)
+    all_per_expert = allgather_object(local_per_expert, group, num_ranks)
 
     expert_counts = []
     for e in range(epr):
@@ -209,7 +232,7 @@ def build_scenarios(num_tokens, num_topk, num_experts, num_ranks, rank, seed):
 
 
 def verify_one(name, topk_idx_cpu, num_experts, num_channels, expert_alignment,
-               buffer, device, rank, num_ranks, mpi_comm):
+               buffer, device, rank, num_ranks, group):
     """Run one test case, return list of errors (empty = pass)"""
     import deep_ep_xpu as deep_ep
 
@@ -231,7 +254,7 @@ def verify_one(name, topk_idx_cpu, num_experts, num_channels, expert_alignment,
     # Python reference
     exp_recv, exp_experts, exp_prefix_col, exp_channel = reference_notify_dispatch(
         per_rank.cpu(), per_expert.cpu(), is_in_rank.cpu(),
-        num_ranks, num_experts, num_channels, expert_alignment, rank, mpi_comm)
+        num_ranks, num_experts, num_channels, expert_alignment, rank, group)
 
     errors = []
 
@@ -290,14 +313,16 @@ def run_tests(args):
         sys.path.insert(0, repo_root)
     import deep_ep_xpu as deep_ep
 
-    rank, num_ranks, group, device, mpi_comm = init_dist_mpi(args.port)
+    if LAUNCHER == 'torchrun':
+        rank, num_ranks, group, device = init_dist_torchrun()
+    else:
+        rank, num_ranks, group, device = init_dist_mpi(args.port)
 
     buffer = deep_ep.Buffer(
         group, int(1e8), 0,
-        low_latency_mode=False,
-        comm=mpi_comm)
+        low_latency_mode=False)
 
-    mpi_comm.Barrier()
+    dist.barrier(group=group)
 
     mode = args.mode
     num_tokens = args.num_tokens
@@ -325,10 +350,10 @@ def run_tests(args):
         total_fail = 0
 
         for name, topk_cpu in cases:
-            mpi_comm.Barrier()
+            dist.barrier(group=group)
             errors = verify_one(
                 name, topk_cpu, num_experts, num_channels,
-                expert_alignment, buffer, device, rank, num_ranks, mpi_comm)
+                expert_alignment, buffer, device, rank, num_ranks, group)
             if errors:
                 total_fail += 1
                 if rank == 0:
@@ -340,7 +365,7 @@ def run_tests(args):
                 if rank == 0:
                     print(f"  PASS {name} (tokens={topk_cpu.shape[0]})")
 
-        mpi_comm.Barrier()
+        dist.barrier(group=group)
         if rank == 0:
             print(f"\n{'='*60}")
             print(f"  Result: {total_pass} passed, {total_fail} failed")
@@ -371,10 +396,10 @@ def run_tests(args):
                         per_rank, per_expert, is_in_rank,
                         num_tokens, num_experts, num_channels, expert_alignment)
             torch.xpu.synchronize()
-            mpi_comm.Barrier()
+            dist.barrier(group=group)
 
         # timed run
-        mpi_comm.Barrier()
+        dist.barrier(group=group)
         torch.xpu.synchronize()
         t0 = time.time()
         with suppress_cpp_stdout():
@@ -384,7 +409,7 @@ def run_tests(args):
                     num_tokens, num_experts, num_channels, expert_alignment)
         torch.xpu.synchronize()
         elapsed = time.time() - t0
-        mpi_comm.Barrier()
+        dist.barrier(group=group)
 
         if rank == 0:
             avg_us = elapsed * 1e6 / inner
@@ -426,7 +451,7 @@ def run_tests(args):
                         num_tokens, num_experts, num_channels, expert_alignment)
                 prof.step()
 
-        mpi_comm.Barrier()
+        dist.barrier(group=group)
         if rank == 0:
             json_files = [f for f in os.listdir(trace_dir) if f.endswith('.json')]
             print(f"\n{'='*60}")

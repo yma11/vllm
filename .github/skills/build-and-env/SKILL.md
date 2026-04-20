@@ -30,16 +30,19 @@ bash -c 'source ~/zhenyuan/DeepEP/env.sh && python setup.py build_ext --inplace 
 
 ## Running Tests
 
-All tests require `mpirun` with `ZE_AFFINITY_MASK` set per rank. The standard pattern:
+All tests require `ZE_AFFINITY_MASK` to be exported **before** the run command. Set it in the shell first, then launch with `mpirun`:
 
 ```bash
+export ZE_AFFINITY_MASK=0,1,2,3
+export RenderCompressedBuffersEnabled=0
+export NEOReadDebugKeys=1
+
 bash -c 'source ~/zhenyuan/DeepEP/env.sh && cd /home/sdp/zhenyuan/frameworks.ai.pytorch.deepep && \
-  mpirun -np <N> bash -c "export ZE_AFFINITY_MASK=\${MPI_LOCALRANKID} RenderCompressedBuffersEnabled=0 NEOReadDebugKeys=1 && \
-  python tests/<test_file>.py <args>"'
+  mpirun -np <N> python tests/<test_file>.py <args>'
 ```
 
 **Always confirm with the user before running**:
 - Number of processes (`-np`)
-- `ZE_AFFINITY_MASK` mapping
+- `ZE_AFFINITY_MASK` value (e.g., `0123` for 4 GPUs)
 - Additional environment variables
 - Test script arguments

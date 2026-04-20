@@ -16,9 +16,13 @@ perf mode — latency and bandwidth benchmark (no verification):
   Reports per-iteration combine latency (ms) and algorithmic bandwidth (GB/s).
 
 Example commands:
+    # mpirun (default, DEEPEP_LAUNCHER=mpi)
     mpirun -np 4 python tests/test_xpu_combine_stress.py --dtype int32 --mode verify
     mpirun -np 4 python tests/test_xpu_combine_stress.py --dtype int32 --mode perf --num-tokens 1024 --repeat 20
     mpirun -np 4 python tests/test_xpu_combine_stress.py --dtype bfloat16 --mode perf --num-tokens 4096 --repeat 20
+    # torchrun (set DEEPEP_LAUNCHER=torchrun)
+    DEEPEP_LAUNCHER=torchrun torchrun --nproc_per_node=4 tests/test_xpu_combine_stress.py --dtype int32 --mode verify
+    DEEPEP_LAUNCHER=torchrun torchrun --nproc_per_node=4 tests/test_xpu_combine_stress.py --dtype bfloat16 --mode perf
 """
 
 import argparse
@@ -37,7 +41,10 @@ import torch.distributed as dist
 os.environ['USE_XPU'] = '1'
 os.environ['USE_CUDA'] = '0'
 
-from mpi4py import MPI
+LAUNCHER = os.environ.get('DEEPEP_LAUNCHER', 'mpi').lower()
+
+if LAUNCHER == 'mpi':
+    from mpi4py import MPI
 
 DTYPE_MAP = {
     'int32':    torch.int32,
@@ -64,6 +71,20 @@ def init_dist_mpi(port: int = 29500):
         world_size=world_size,
         rank=rank
     )
+
+    group = dist.new_group(list(range(world_size)))
+    return rank, world_size, group, device
+
+
+def init_dist_torchrun():
+    rank = int(os.environ['RANK'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+
+    torch.xpu.set_device(local_rank)
+    device = f'xpu:{local_rank}'
+
+    dist.init_process_group(backend='xccl')
 
     group = dist.new_group(list(range(world_size)))
     return rank, world_size, group, device
@@ -216,8 +237,10 @@ def main():
     import deep_ep_xpu as deep_ep
 
     dtype = DTYPE_MAP[args.dtype]
-    rank, num_ranks, group, device = init_dist_mpi(port=args.port)
-    comm = MPI.COMM_WORLD
+    if LAUNCHER == 'torchrun':
+        rank, num_ranks, group, device = init_dist_torchrun()
+    else:
+        rank, num_ranks, group, device = init_dist_mpi(port=args.port)
 
     assert args.num_experts % num_ranks == 0
 
@@ -278,7 +301,7 @@ def main():
                   flush=True)
 
     torch.xpu.synchronize()
-    comm.Barrier()
+    dist.barrier()
 
     if combine_times:
         avg_c  = sum(combine_times) / len(combine_times)
@@ -290,7 +313,9 @@ def main():
               f'avg_bw={avg_bw:.2f}GB/s errors={total_errors}', flush=True)
 
     if args.mode == 'verify':
-        all_passed = comm.allreduce(all_passed_local, op=MPI.LAND)
+        passed_tensor = torch.tensor([int(all_passed_local)], dtype=torch.int32, device=device)
+        dist.all_reduce(passed_tensor, op=dist.ReduceOp.MIN)
+        all_passed = bool(passed_tensor.item())
         if rank == 0:
             if all_passed:
                 print('\n========== ALL PASSED ==========\n', flush=True)
@@ -304,7 +329,6 @@ def main():
     except Exception:
         pass
 
-    comm.Barrier()
     if not all_passed:
         sys.exit(1)
 
