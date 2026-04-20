@@ -178,10 +178,10 @@ mpirun -np 4 python tests/test_xpu_combine_stress.py --dtype int32 --mode verify
 
 ## Performance Benchmark
 
-Measured on **Intel Arc Pro B60 × 8**，intranode IPC path，`hidden=5120, topk=2, num_experts=128, warmup=3, repeat=5`。
+Measured on **Intel Arc Pro B60 × 8**, intranode IPC path, `hidden=5120, topk=2, num_experts=128, warmup=3, repeat=5`.
 
 ```bash
-# 测试命令（以 8 cards, 4096 tokens 为例）
+# Example: 8 cards, 4096 tokens
 export ZE_AFFINITY_MASK=0,1,2,3,4,5,6,7
 export RenderCompressedBuffersEnabled=0
 export NEOReadDebugKeys=1
@@ -198,7 +198,7 @@ bash -c 'source /path/to/setvars.sh 2>/dev/null && eval "$(conda shell.bash hook
 | 8 | 16 | ~0.96 ms | ~0.97 ms | ~0.17 GB/s |
 | 8 | 4096 | ~80 ms | ~199 ms | ~0.21 GB/s |
 
-> **注**：16 token 场景为 latency-bound（数据量 ~160 KB，内核启动开销占主导）；4096 token 场景进入 bandwidth-bound 区间，带宽随 GPU 数增加略有下降（路由分散，每卡收到的 token 更稀疏）。
+> **Note**: The 16-token case is latency-bound (~160 KB of data, dominated by kernel launch overhead). The 4096-token case enters the bandwidth-bound regime; bandwidth decreases slightly with more GPUs due to sparser token distribution across experts per rank.
 
 ## Supported dtypes
 
