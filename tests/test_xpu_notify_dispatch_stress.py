@@ -31,8 +31,6 @@ LAUNCHER = os.environ.get('DEEPEP_LAUNCHER', 'mpi').lower()
 if LAUNCHER == 'mpi':
     from mpi4py import MPI
 
-os.environ.setdefault('USE_XPU', '1')
-os.environ.setdefault('USE_CUDA', '0')
 
 # ─── Initialization ──────────────────────────────────────────
 

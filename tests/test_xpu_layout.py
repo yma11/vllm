@@ -22,8 +22,6 @@ import torch.distributed as dist
 
 from mpi4py import MPI
 
-os.environ['USE_XPU'] = '1'
-os.environ['USE_CUDA'] = '0'
 
 
 def init_dist_mpi(port: int = 29500):

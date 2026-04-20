@@ -23,8 +23,6 @@ import time
 import torch
 import torch.distributed as dist
 
-os.environ['USE_XPU'] = '1'
-os.environ['USE_CUDA'] = '0'
 
 LAUNCHER = os.environ.get('DEEPEP_LAUNCHER', 'mpi').lower()
 
