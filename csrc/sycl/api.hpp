@@ -85,6 +85,40 @@ void dispatch(void* recv_x,
               int num_eus,
               int num_max_send_tokens,
               int num_recv_buffer_tokens);
+
+void combine(DataType type,
+             void* recv_x,
+             float* recv_topk_weights,
+             const void* x,
+             const float* topk_weights,
+             const void* bias_0,
+             const void* bias_1,
+             const int* src_idx,
+             const int* rank_prefix_matrix,
+             const int* channel_prefix_matrix,
+             int* send_head,
+             int num_tokens,
+             int num_recv_tokens,
+             int hidden,
+             int num_topk,
+             void** buffer_ptrs,
+             int rank,
+             int num_ranks,
+             sycl::queue& stream,
+             int num_eus,
+             int num_max_send_tokens,
+             int num_recv_buffer_tokens);
+
+void cached_notify_combine(void** buffer_ptrs,
+                           int* send_head,
+                           int num_channels,
+                           int num_recv_tokens,
+                           int num_memset_int,
+                           int** barrier_signal_ptrs,
+                           int rank,
+                           int num_ranks,
+                           sycl::queue& stream);
+
 }  // namespace intranode
 
 }  // namespace deep_ep

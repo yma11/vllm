@@ -13,6 +13,7 @@
 #include <sycl/sycl.hpp>
 #include <level_zero/ze_api.h>
 #include "sycl/configs.h"
+#include "sycl/utils.hpp"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -475,6 +476,284 @@ std::vector<std::optional<pybind11::bytearray>> Buffer::all_gather_handle(
     return result;
 }
 
+template <int kNumRanks>
+class CachedNotifyCombineKernel {
+public:
+    CachedNotifyCombineKernel(
+        void** buffer_ptrs,
+        int* send_head,
+        int num_channels,
+        int num_recv_tokens,
+        int num_memset_int,
+        int** barrier_signal_ptrs,
+        int rank)
+        : buffer_ptrs_(buffer_ptrs),
+          send_head_(send_head),
+          num_channels_(num_channels),
+          num_recv_tokens_(num_recv_tokens),
+          num_memset_int_(num_memset_int),
+          barrier_signal_ptrs_(barrier_signal_ptrs),
+          rank_(rank) {}
+
+    SYCL_EXTERNAL void operator()(sycl::nd_item<1> item) const {
+        auto sm_id = static_cast<int>(item.get_group(0));
+        auto thread_id = static_cast<int>(item.get_local_id(0));
+        auto num_threads = static_cast<int>(item.get_local_range(0));
+
+        if (sm_id == 0) {
+            // Block 0: Clean IPC buffer
+
+            // Barrier before cleaning
+            barrier_block_bypass<kNumRanks, true>(barrier_signal_ptrs_, rank_, item);
+
+            // Clean buffer
+            auto ptr = static_cast<int*>(buffer_ptrs_[rank_]);
+            #pragma unroll
+            for (int i = thread_id; i < num_memset_int_; i += num_threads)
+                ptr[i] = 0;
+
+            // Barrier after cleaning
+            barrier_block_bypass<kNumRanks>(barrier_signal_ptrs_, rank_, item);
+        } else {
+            // Block 1 ~ num_channels: Fill in send_head array
+            const auto channel_id = sm_id - 1;
+            const auto rank_id = thread_id / 32;
+            const auto lane_id = thread_id % 32;
+            
+            // Return if rank_id is out of range
+            if (rank_id >= kNumRanks)
+                return;
+
+            // Get the token range this channel is responsible for
+            int token_start_idx, token_end_idx;
+            get_channel_task_range(num_recv_tokens_, num_channels_, channel_id, token_start_idx, token_end_idx);
+
+            // NOTES: `1 << 25` is a heuristic large number
+            int last_head = 1 << 25;
+            
+            // Traverse from back to front, filling in reasonable values for negative send_head entries
+            #pragma unroll
+            for (int token_idx_tail = token_end_idx - 1; token_idx_tail >= token_start_idx; token_idx_tail -= 32) {
+                int token_idx = token_idx_tail - lane_id;
+                int expected_head = 0;
+                
+                // Read current head value; set to -1 if token_idx is out of bounds
+                auto current_head = (token_idx >= token_start_idx) ? 
+                    ld_nc_global(send_head_ + token_idx * kNumRanks + rank_id) : -1;
+                
+                // Process each token sequentially within the warp
+                auto sg = item.get_sub_group();
+                int num_iters = sycl::min(32, token_idx_tail - token_start_idx + 1);
+                for (int i = 0; i < num_iters; ++i) {
+                    // Broadcast head value from lane i
+                    const int head = sycl::select_from_group(sg, current_head, i);
+                    if (head < 0) {
+                        // If head is negative, current lane needs to compute expected_head
+                        if (lane_id == i)
+                            expected_head = -last_head - 1;
+                    } else {
+                        // Update last_head
+                        last_head = head;
+                    }
+                }
+                
+                // If current_head is negative and token_idx is valid, write back expected_head
+                if (current_head < 0 && token_idx >= token_start_idx)
+                    send_head_[token_idx * kNumRanks + rank_id] = expected_head;
+            }
+        }
+    }
+
+private:
+    void** buffer_ptrs_;
+    int* send_head_;
+    int num_channels_;
+    int num_recv_tokens_;
+    int num_memset_int_;
+    int** barrier_signal_ptrs_;
+    int rank_;
+};
+
+namespace intranode {
+
+void cached_notify_combine(void** buffer_ptrs,
+                           int* send_head,
+                           int num_channels,
+                           int num_recv_tokens,
+                           int num_memset_int,
+                           int** barrier_signal_ptrs,
+                           int rank,
+                           int num_ranks,
+                           sycl::queue& stream) {
+    
+    // Thread count: at least 128, each rank needs 32 threads (one warp)
+    const int num_threads = std::max(128, 32 * num_ranks);
+    EP_HOST_ASSERT(num_ranks <= num_threads);
+    EP_HOST_ASSERT(num_threads <= 1024);
+    EP_HOST_ASSERT(1 + num_channels <= num_channels * 2);
+
+    // grid size: 1 + num_channels
+    // - Block 0: Clean IPC buffer
+    // - Block 1 ~ num_channels: Fill in send_head array
+    int num_blocks = 1 + num_channels;
+    sycl::range<1> global_range(num_blocks * num_threads);
+    sycl::range<1> local_range(num_threads);
+
+    #define CACHED_NOTIFY_COMBINE_LAUNCH_CASE(ranks)                                    \
+        case ranks:                                                                     \
+            stream.submit([&](sycl::handler& cgh) {                                \
+                                                                                                        cgh.parallel_for(                                                      \
+                    sycl::nd_range<1>(global_range, local_range),                     \
+                    [=](sycl::nd_item<1> item) {                                      \
+                        CachedNotifyCombineKernel<ranks> kernel(                       \
+                            buffer_ptrs,                                               \
+                            send_head,                                                 \
+                            num_channels,                                              \
+                            num_recv_tokens,                                           \
+                            num_memset_int,                                            \
+                            barrier_signal_ptrs,                                       \
+                            rank);                                                     \
+                        kernel(item);                                                  \
+                    });                                                                \
+            });                                                                        \
+            break
+
+    switch (num_ranks) {
+        CACHED_NOTIFY_COMBINE_LAUNCH_CASE(2);
+        CACHED_NOTIFY_COMBINE_LAUNCH_CASE(4);
+        CACHED_NOTIFY_COMBINE_LAUNCH_CASE(8);
+        default:
+            EP_HOST_ASSERT(false && "Unsupported number of ranks");
+    }
+
+    #undef CACHED_NOTIFY_COMBINE_LAUNCH_CASE
+    
+    stream.wait();
+}
+
+}  // namespace intranode
+
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<deep_ep::EventHandle>>
+deep_ep::Buffer::intranode_combine(const torch::Tensor& x,
+                                  const std::optional<torch::Tensor>& topk_weights,
+                                  const std::optional<torch::Tensor>& bias_0,
+                                  const std::optional<torch::Tensor>& bias_1,
+                                  const torch::Tensor& src_idx,
+                                  const torch::Tensor& rank_prefix_matrix,
+                                  const torch::Tensor& channel_prefix_matrix,
+                                  const torch::Tensor& send_head,
+                                  const deep_ep::Config& config,
+                                  std::optional<deep_ep::EventHandle>& previous_event,
+                                  bool async,
+                                  bool allocate_on_comm_stream) {
+    // Validate input tensors
+    EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
+    EP_HOST_ASSERT(src_idx.dim() == 1 and src_idx.is_contiguous() and src_idx.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(send_head.dim() == 2 and send_head.is_contiguous() and send_head.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(rank_prefix_matrix.dim() == 2 and rank_prefix_matrix.is_contiguous() and
+                   rank_prefix_matrix.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(channel_prefix_matrix.dim() == 2 and channel_prefix_matrix.is_contiguous() and
+                   channel_prefix_matrix.scalar_type() == torch::kInt32);
+
+    // One channel uses two blocks: even-numbered for sending, odd-numbered for receiving.
+    EP_HOST_ASSERT(config.num_eus % 2 == 0);
+    int num_channels = config.num_eus / 2;
+
+    auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
+    auto num_recv_tokens = static_cast<int>(send_head.size(0));  // Original token count
+    EP_HOST_ASSERT(src_idx.size(0) == num_tokens);
+    EP_HOST_ASSERT(send_head.size(1) == num_ranks);
+    EP_HOST_ASSERT(rank_prefix_matrix.size(0) == num_ranks and rank_prefix_matrix.size(1) == num_ranks);
+    EP_HOST_ASSERT(channel_prefix_matrix.size(0) == num_ranks and channel_prefix_matrix.size(1) == num_channels);
+    EP_HOST_ASSERT((hidden * x.element_size()) % sizeof(int4) == 0);
+
+    // Handle topk weights
+    int num_topk = 0;
+    auto recv_topk_weights = std::optional<torch::Tensor>();
+    float* topk_weights_ptr = nullptr;
+    float* recv_topk_weights_ptr = nullptr;
+    if (topk_weights.has_value()) {
+        EP_HOST_ASSERT(topk_weights->dim() == 2 and topk_weights->is_contiguous());
+        EP_HOST_ASSERT(topk_weights->size(0) == num_tokens);
+        EP_HOST_ASSERT(topk_weights->scalar_type() == torch::kFloat32);
+        num_topk = static_cast<int>(topk_weights->size(1));
+        topk_weights_ptr = topk_weights->data_ptr<float>();
+        recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
+        recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
+    }
+
+    // Launch barrier and reset queue head and tail
+    EP_HOST_ASSERT(num_channels * num_ipc_ranks * sizeof(int) * 2 <= num_ipc_bytes);
+    intranode::cached_notify_combine(buffer_ptrs_gpu,
+                                     send_head.data_ptr<int>(),
+                                     num_channels,
+                                     num_recv_tokens,
+                                     num_channels * num_ipc_ranks * 2,
+                                     barrier_signal_ptrs_gpu,
+                                     ipc_rank,
+                                     num_ipc_ranks,
+                                     comm_stream);
+
+    // Assign bias pointers
+    auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
+    void* bias_ptrs[2] = {nullptr, nullptr};
+    for (int i = 0; i < 2; ++i)
+        if (bias_opts[i].has_value()) {
+            auto bias = bias_opts[i].value();
+            EP_HOST_ASSERT(bias.dim() == 2 and bias.is_contiguous());
+            EP_HOST_ASSERT(bias.scalar_type() == x.scalar_type());
+            EP_HOST_ASSERT(bias.size(0) == num_recv_tokens and bias.size(1) == hidden);
+            bias_ptrs[i] = bias.data_ptr();
+        }
+
+    // Allocate output tensor with correct size (num_recv_tokens is the original token count)
+    auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+    EP_HOST_ASSERT(num_channels * num_ipc_ranks * sizeof(int) * 2 +  // Queue head and tail
+                       num_channels * num_ipc_ranks * config.num_max_ipc_chunked_recv_tokens * hidden * x.element_size() +  // Data buffer
+                       num_channels * num_ipc_ranks * config.num_max_ipc_chunked_recv_tokens * sizeof(int) +             // Source index buffer
+                       num_channels * num_ipc_ranks * config.num_max_ipc_chunked_recv_tokens * num_topk * sizeof(float)  // Top-k weight buffer
+                   <= num_ipc_bytes);
+
+    // Map torch dtype to SYCL DataType enum
+    DataType sycl_dtype;
+    switch (x.scalar_type()) {
+        case torch::kBFloat16: sycl_dtype = DataType::kBFloat16; break;
+        case torch::kInt32:    sycl_dtype = DataType::kInt32;    break;
+        default: EP_HOST_ASSERT(false && "Unsupported dtype for combine");
+    }
+
+    // Call combine kernel
+    intranode::combine(sycl_dtype,
+                       recv_x.data_ptr(),
+                       recv_topk_weights_ptr,
+                       x.data_ptr(),
+                       topk_weights_ptr,
+                       bias_ptrs[0],
+                       bias_ptrs[1],
+                       src_idx.data_ptr<int>(),
+                       rank_prefix_matrix.data_ptr<int>(),
+                       channel_prefix_matrix.data_ptr<int>(),
+                       send_head.data_ptr<int>(),
+                       num_tokens,
+                       num_recv_tokens,
+                       hidden,
+                       num_topk,
+                       buffer_ptrs_gpu,
+                       ipc_rank,
+                       num_ipc_ranks,
+                       comm_stream,
+                       config.num_eus,
+                       config.num_max_ipc_chunked_send_tokens,
+                       config.num_max_ipc_chunked_recv_tokens);
+
+    // Wait for completion if not async
+    if (!async) {
+        comm_stream.wait();
+    }
+
+    return std::make_tuple(recv_x, recv_topk_weights, std::nullopt);
+}
+
 
 }  // namespace deep_ep
 
@@ -549,6 +828,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("cached_channel_prefix_matrix"),
              py::arg("expert_alignment"),
              py::arg("num_worst_tokens"),
+             py::arg("config"),
+             py::arg("previous_event"),
+             py::arg("async_op") = false,
+             py::arg("allocate_on_comm_stream") = false)
+        .def("intranode_combine", &deep_ep::Buffer::intranode_combine,
+             py::arg("x"),
+             py::arg("topk_weights"),
+             py::arg("bias_0"),
+             py::arg("bias_1"),
+             py::arg("src_idx"),
+             py::arg("rank_prefix_matrix"),
+             py::arg("channel_prefix_matrix"),
+             py::arg("send_head"),
              py::arg("config"),
              py::arg("previous_event"),
              py::arg("async_op") = false,

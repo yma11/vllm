@@ -44,7 +44,11 @@ typedef INT_BITS_T(TOPK_IDX_BITS) topk_idx_t;
 #undef INT_BITS_T2
 
 using StreamType = sycl::queue;
-using DataType = std::nullptr_t;
+
+enum class DataType {
+    kBFloat16,
+    kInt32,
+};
 
 struct Config {
     int num_eus;

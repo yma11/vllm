@@ -180,6 +180,21 @@ public:
                        bool async,
                        bool allocate_on_comm_stream);
 
+    // Intranode combine
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
+    intranode_combine(const torch::Tensor& x,
+                      const std::optional<torch::Tensor>& topk_weights,
+                      const std::optional<torch::Tensor>& bias_0,
+                      const std::optional<torch::Tensor>& bias_1,
+                      const torch::Tensor& src_idx,
+                      const torch::Tensor& rank_prefix_matrix,
+                      const torch::Tensor& channel_prefix_matrix,
+                      const torch::Tensor& send_head,
+                      const Config& config,
+                      std::optional<EventHandle>& previous_event,
+                      bool async,
+                      bool allocate_on_comm_stream);
+
     // Notify dispatch test
     std::tuple<int, std::vector<int>, torch::Tensor, torch::Tensor> test_notify_dispatch(
         const torch::Tensor& num_tokens_per_rank,
