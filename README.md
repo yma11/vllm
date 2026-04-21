@@ -191,14 +191,14 @@ bash -c 'source /path/to/setvars.sh 2>/dev/null && eval "$(conda shell.bash hook
   --dtype bfloat16 --mode perf --num-tokens 4096 --num-experts 128 --repeat 5'
 ```
 
-| GPUs | num_tokens | dispatch avg | combine avg | combine bw |
-|------|-----------|-------------|-------------|------------|
-| 4 | 16 | ~0.81 ms | ~0.87 ms | ~0.19 GB/s |
-| 4 | 4096 | ~54 ms | ~156 ms | ~0.27 GB/s |
-| 8 | 16 | ~0.96 ms | ~0.97 ms | ~0.17 GB/s |
-| 8 | 4096 | ~80 ms | ~199 ms | ~0.21 GB/s |
+| GPUs | num_tokens | dispatch avg | combine avg |
+|------|-----------|-------------|-------------|
+| 4 | 16 | ~0.81 ms | ~0.87 ms |
+| 4 | 4096 | ~54 ms | ~156 ms |
+| 8 | 16 | ~0.96 ms | ~0.97 ms |
+| 8 | 4096 | ~80 ms | ~199 ms |
 
-> **Note**: The 16-token case is latency-bound (~160 KB of data, dominated by kernel launch overhead). The 4096-token case enters the bandwidth-bound regime; bandwidth decreases slightly with more GPUs due to sparser token distribution across experts per rank.
+> **Note**: The 16-token case is latency-bound (~160 KB of data, dominated by kernel launch overhead). The 4096-token case enters the bandwidth-bound regime; latency increases slightly with more GPUs due to sparser token distribution across experts per rank.
 
 ## Supported dtypes
 

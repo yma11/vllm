@@ -12,8 +12,8 @@ verify mode (int32 only) — correctness check via a full dispatch -> combine pi
   x[i,:] = rank * 1000000 + i
   Expected: combined_x[i,:] == original_value * num_copies[i]  (exact integer equality)
 
-perf mode — latency and bandwidth benchmark (no verification):
-  Reports per-iteration combine latency (ms) and algorithmic bandwidth (GB/s).
+perf mode — latency benchmark (no verification):
+  Reports per-iteration dispatch and combine latency (ms).
 
 Example commands:
     # mpirun (default, DEEPEP_LAUNCHER=mpi)
@@ -226,7 +226,7 @@ def main():
     parser.add_argument('--dtype', choices=['int32', 'bfloat16'], default='int32',
                         help='Input tensor dtype (bfloat16 supports perf mode only)')
     parser.add_argument('--mode', choices=['verify', 'perf'], default='verify',
-                        help='verify: correctness check (int32 only); perf: latency/bandwidth benchmark')
+                        help='verify: correctness check (int32 only); perf: latency benchmark')
     args = parser.parse_args()
 
     if args.dtype == 'bfloat16' and args.mode == 'verify':
@@ -241,8 +241,6 @@ def main():
         rank, num_ranks, group, device = init_dist_mpi(port=args.port)
 
     assert args.num_experts % num_ranks == 0
-
-    dtype_bytes = torch.tensor([], dtype=dtype).element_size()
 
     if rank == 0:
         print(f'[init] {num_ranks} ranks, device={device}', flush=True)
@@ -277,9 +275,6 @@ def main():
         dispatch_times.append(d_ms)
         combine_times.append(c_ms)
 
-        # Algorithmic bandwidth: num_tokens * hidden * dtype_bytes (combine output) / time
-        alg_bw = args.num_tokens * args.hidden * dtype_bytes / (c_ms * 1e-3) / 1e9
-
         if args.mode == 'verify':
             verbose = (iteration == 0 and rank == 0)
             errs = verify_combine(combined_x, is_tok_in_rank, rank,
@@ -291,11 +286,11 @@ def main():
                     print(f'[rank {rank}] iter {iteration} ERROR: {e}', flush=True)
             else:
                 print(f'[rank {rank}] iter {iteration} OK '
-                      f'(dispatch={d_ms:.3f}ms combine={c_ms:.3f}ms bw={alg_bw:.2f}GB/s)',
+                      f'(dispatch={d_ms:.3f}ms combine={c_ms:.3f}ms)',
                       flush=True)
         else:  # perf
             print(f'[rank {rank}] iter {iteration} '
-                  f'dispatch={d_ms:.3f}ms combine={c_ms:.3f}ms bw={alg_bw:.2f}GB/s',
+                  f'dispatch={d_ms:.3f}ms combine={c_ms:.3f}ms',
                   flush=True)
 
     torch.xpu.synchronize()
@@ -305,10 +300,9 @@ def main():
         avg_c  = sum(combine_times) / len(combine_times)
         min_c  = min(combine_times)
         max_c  = max(combine_times)
-        avg_bw = args.num_tokens * args.hidden * dtype_bytes / (avg_c * 1e-3) / 1e9
         print(f'[rank {rank}] combine summary: '
               f'avg={avg_c:.3f}ms min={min_c:.3f}ms max={max_c:.3f}ms '
-              f'avg_bw={avg_bw:.2f}GB/s errors={total_errors}', flush=True)
+              f'errors={total_errors}', flush=True)
 
     if args.mode == 'verify':
         passed_tensor = torch.tensor([int(all_passed_local)], dtype=torch.int32, device=device)
