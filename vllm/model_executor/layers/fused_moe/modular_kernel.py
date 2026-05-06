@@ -1380,6 +1380,26 @@ class FusedMoEKernelModularImpl:
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
+        if current_platform.is_xpu():
+            self.fused_experts.apply(
+                output=output,
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                a1q_scale=None,
+                a2_scale=self.fused_experts.a2_scale,
+                workspace13=None,
+                workspace2=None,
+                expert_tokens_meta=None,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+            return output
+
         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
             hidden_states,
             topk_weights,
