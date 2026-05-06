@@ -265,6 +265,15 @@ class MoERunner(MoERunnerInterface):
 
         self._forward_entry = self._select_forward()
 
+        self.skip_pad_hidden_states = False
+        self.pure_fused_moe = False
+        if self.routed_input_transform is None \
+            and self._shared_experts is None \
+            and self.routed_scaling_factor == 1.0 \
+            and self.routed_output_transform is None \
+            and not isinstance(self.router, ZeroExpertRouter):
+            self.pure_fused_moe = True
+
     def _select_forward(self) -> Callable:
         if current_platform.is_tpu() or current_platform.is_cpu():
             # TODO: Once the OOM issue for the TPU backend is resolved, we
@@ -621,6 +630,23 @@ class MoERunner(MoERunnerInterface):
         1. pytorch cannot handle union types in custom op signatures so
            _moe_forward and _moe_forward_shared must be split.
         """
+        if self.pure_fused_moe:
+            og_hidden_dim = hidden_states.shape[-1]
+            if not self.skip_pad_hidden_states:
+                hidden_states, og_hidden_dim_pad = self._maybe_pad_hidden_states(
+                    None,
+                    hidden_states,
+                )
+                if og_hidden_dim_pad == og_hidden_dim:
+                    self.skip_pad_hidden_states = True
+                og_hidden_dim = og_hidden_dim_pad
+            result = self._forward_entry(
+                hidden_states,
+                router_logits,
+                None,
+                self._encode_layer_name(),
+            )
+            return self._maybe_reduce_final_output(result, og_hidden_dim)
 
         # Apply transform for routed experts (e.g., latent projection
         # for latent MoE)
