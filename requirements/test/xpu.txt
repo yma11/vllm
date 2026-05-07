@@ -667,9 +667,10 @@ tqdm==4.67.3
     #   pqdm
     #   sentence-transformers
     #   transformers
-transformers==5.5.3
+transformers==5.8.0
     # via
     #   -c requirements/common.txt
+    #   -c requirements/xpu.txt
     #   sentence-transformers
 triton-xpu==3.7.0
     # via torch
