@@ -244,11 +244,13 @@ class MoERunner(MoERunnerInterface):
 
         self.skip_pad_hidden_states = False
         self.pure_fused_moe = False
-        if self.routed_input_transform is None \
-            and self._shared_experts is None \
-            and self.routed_scaling_factor == 1.0 \
-            and self.routed_output_transform is None \
-            and not isinstance(self.router, ZeroExpertRouter):
+        if (
+            self.routed_input_transform is None
+            and self._shared_experts is None
+            and self.routed_scaling_factor == 1.0
+            and self.routed_output_transform is None
+            and not isinstance(self.router, ZeroExpertRouter)
+        ):
             self.pure_fused_moe = True
 
     def _select_forward(self) -> Callable:
@@ -576,6 +578,7 @@ class MoERunner(MoERunnerInterface):
                 hidden_states,
                 router_logits,
                 None,
+                input_ids,
                 self._encode_layer_name(),
             )
             return self._maybe_reduce_final_output(result, og_hidden_dim)
