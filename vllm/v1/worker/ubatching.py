@@ -6,15 +6,19 @@ import torch
 
 from vllm import forward_context
 from vllm.forward_context import ForwardContext
-from vllm.logger import init_logger
 from vllm.utils.torch_utils import current_stream
-
-logger = init_logger(__name__)
 
 _THREAD_ID_TO_CONTEXT: dict = {}
 # Here we hardcode the number of microbatches to 2 for default.
 _NUM_UBATCHES: int = 2
 _CURRENT_CONTEXTS: list["UBatchContext | None"] = []
+
+
+def _get_current_context() -> "UBatchContext | None":
+    ctx_idx = _THREAD_ID_TO_CONTEXT.get(threading.get_ident())
+    if ctx_idx is None or ctx_idx >= len(_CURRENT_CONTEXTS):
+        return None
+    return _CURRENT_CONTEXTS[ctx_idx]
 
 
 class UBatchContext:
@@ -196,7 +200,8 @@ def dbo_get_previous_event(func, *args, **kwargs):
         ctx = _CURRENT_CONTEXTS[ctx_idx]
         # execute callable on the ubatch compute stream to record/wait events there
         with torch.cuda.stream(ctx.compute_stream):
-            return func(*args, **kwargs)
+            event = func(*args, **kwargs)
+            return event
 
 
 def make_ubatch_contexts(
