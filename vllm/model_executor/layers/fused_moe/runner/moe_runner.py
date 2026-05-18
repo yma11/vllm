@@ -648,6 +648,7 @@ class MoERunner(MoERunnerInterface):
                 None,
                 input_ids,
                 self._encode_layer_name(),
+                self._trtllm_mxfp4_unpadded_dim(),
             )
             return self._maybe_reduce_final_output(result, og_hidden_dim)
 
