@@ -165,14 +165,14 @@ Buffer::Buffer(int rank,
     workspace = sycl::malloc_device(NUM_WORKSPACE_BYTES, comm_stream);
     comm_stream.memset(workspace, 0, NUM_WORKSPACE_BYTES).wait();
 
-    // MoE counters (shared memory for host-device access)
+    // MoE counters (pinned host memory for host-device access)
     moe_recv_counter = const_cast<volatile int*>(
-        static_cast<int*>(sycl::malloc_shared(sizeof(int64_t), comm_stream)));
+        static_cast<int*>(sycl::malloc_host(sizeof(int64_t), comm_stream)));
     moe_recv_counter_mapped = const_cast<int*>(moe_recv_counter);
     *moe_recv_counter = -1;
 
     moe_recv_expert_counter = const_cast<volatile int*>(
-        static_cast<int*>(sycl::malloc_shared(sizeof(int) * NUM_MAX_LOCAL_EXPERTS, comm_stream)));
+        static_cast<int*>(sycl::malloc_host(sizeof(int) * NUM_MAX_LOCAL_EXPERTS, comm_stream)));
     moe_recv_expert_counter_mapped = const_cast<int*>(moe_recv_expert_counter);
     for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i)
         moe_recv_expert_counter[i] = -1;

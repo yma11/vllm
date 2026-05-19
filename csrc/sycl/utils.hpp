@@ -222,7 +222,7 @@ template <typename T>
 SYCL_EXTERNAL inline void st_na_global_v(T* ptr, T value) {
 #ifdef __SYCL_DEVICE_ONLY__
     static_assert(sizeof(T) == 16, "st_na_global_v requires sizeof(T) == 16");
-    using vec4_t = typename sycl::vec<uint32_t, 4>::vector_t;
+    using vec4_t = uint32_t __attribute__((ext_vector_type(4)));
     vec4_t tmp;
     __builtin_memcpy(&tmp, &value, 16);
     auto* addr = reinterpret_cast<void*>(ptr);
@@ -241,7 +241,7 @@ template <typename T>
 SYCL_EXTERNAL inline T ld_nc_global_v(const T* ptr) {
 #ifdef __SYCL_DEVICE_ONLY__
     static_assert(sizeof(T) == 16, "ld_nc_global_v requires sizeof(T) == 16");
-    using vec4_t = typename sycl::vec<uint32_t, 4>::vector_t;
+    using vec4_t = uint32_t __attribute__((ext_vector_type(4)));
     vec4_t tmp;
     auto* addr = reinterpret_cast<const void*>(ptr);
     asm volatile(
