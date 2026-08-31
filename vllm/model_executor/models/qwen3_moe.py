@@ -81,6 +81,88 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+_QWEN3_MOE_WEIGHT_PAD_QUANT_METHODS = frozenset({"auto_awq", "auto_gptq"})
+
+
+def _get_padded_moe_intermediate_size(
+    moe_intermediate_size: int,
+    quant_config: QuantizationConfig | None,
+    tp_size: int,
+) -> int:
+    if quant_config is None or tp_size <= 1:
+        return moe_intermediate_size
+
+    if quant_config.get_name() not in _QWEN3_MOE_WEIGHT_PAD_QUANT_METHODS:
+        return moe_intermediate_size
+
+    group_size = getattr(quant_config, "group_size", -1)
+    if group_size <= 0 or moe_intermediate_size % group_size != 0:
+        return moe_intermediate_size
+
+    num_groups = moe_intermediate_size // group_size
+    padded_num_groups = ((num_groups + tp_size - 1) // tp_size) * tp_size
+    return padded_num_groups * group_size
+
+
+def _maybe_pad_moe_quant_weight(
+    name: str,
+    loaded_weight: torch.Tensor,
+    quant_config: QuantizationConfig | None,
+    moe_intermediate_size: int,
+    tp_size: int,
+) -> torch.Tensor:
+    moe_intermediate_size_padded = _get_padded_moe_intermediate_size(
+        moe_intermediate_size=moe_intermediate_size,
+        quant_config=quant_config,
+        tp_size=tp_size,
+    )
+    if (
+        moe_intermediate_size_padded == moe_intermediate_size
+        or ".experts." not in name
+        or quant_config is None
+    ):
+        return loaded_weight
+
+    group_size = getattr(quant_config, "group_size", -1)
+    if group_size <= 0:
+        return loaded_weight
+
+    pack_factor = getattr(
+        quant_config,
+        "pack_factor",
+        32 // quant_config.weight_bits,
+    )
+    grouped_moe_intermediate_size_padded = moe_intermediate_size_padded // group_size
+    packed_moe_intermediate_size_padded = moe_intermediate_size_padded // pack_factor
+
+    if ".down_proj.g_idx" in name:
+        pad_size = moe_intermediate_size_padded - loaded_weight.shape[0]
+        if pad_size > 0:
+            loaded_weight = F.pad(loaded_weight, (0, pad_size), value=0)
+    elif ".down_proj.qweight" in name:
+        pad_size = packed_moe_intermediate_size_padded - loaded_weight.shape[0]
+        if pad_size > 0:
+            loaded_weight = F.pad(loaded_weight, (0, 0, 0, pad_size), value=0)
+    elif ".down_proj.scales" in name or ".down_proj.qzeros" in name:
+        pad_size = grouped_moe_intermediate_size_padded - loaded_weight.shape[0]
+        if pad_size > 0:
+            loaded_weight = F.pad(loaded_weight, (0, 0, 0, pad_size), value=0)
+    elif (
+        ".gate_proj.qweight" in name
+        or ".gate_proj.scales" in name
+        or ".up_proj.qweight" in name
+        or ".up_proj.scales" in name
+    ):
+        pad_size = moe_intermediate_size_padded - loaded_weight.shape[1]
+        if pad_size > 0:
+            loaded_weight = F.pad(loaded_weight, (0, pad_size), value=0)
+    elif ".gate_proj.qzeros" in name or ".up_proj.qzeros" in name:
+        pad_size = packed_moe_intermediate_size_padded - loaded_weight.shape[1]
+        if pad_size > 0:
+            loaded_weight = F.pad(loaded_weight, (0, pad_size), value=0)
+
+    return loaded_weight
+
 
 class Qwen3MoeMLP(nn.Module):
     def __init__(
@@ -163,6 +245,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.n_redundant_experts = eplb_config.num_redundant_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
+        self.moe_intermediate_size = _get_padded_moe_intermediate_size(
+            moe_intermediate_size=config.moe_intermediate_size,
+            quant_config=quant_config,
+            tp_size=self.tp_size,
+        )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -202,7 +289,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
+            intermediate_size=self.moe_intermediate_size,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
@@ -646,5 +733,21 @@ class Qwen3MoeForCausalLM(
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        def _maybe_reshape_and_pad(
+            weights: Iterable[tuple[str, torch.Tensor]],
+        ) -> Iterable[tuple[str, torch.Tensor]]:
+            for name, loaded_weight in weights:
+                if "mlp.shared_expert_gate" in name and loaded_weight.dim() == 1:
+                    loaded_weight = loaded_weight[None, :]
+
+                loaded_weight = _maybe_pad_moe_quant_weight(
+                    name=name,
+                    loaded_weight=loaded_weight,
+                    quant_config=self.quant_config,
+                    moe_intermediate_size=self.config.moe_intermediate_size,
+                    tp_size=get_tensor_model_parallel_world_size(),
+                )
+                yield name, loaded_weight
+
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(_maybe_reshape_and_pad(weights))
