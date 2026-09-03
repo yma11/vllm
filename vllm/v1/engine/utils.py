@@ -194,6 +194,12 @@ class CoreEngineProcManager:
                     | {"dp_rank": global_index, "local_dp_rank": local_index},
                 )
             )
+            logger.debug(
+                "CoreEngineProcManager: prepared process name=%s global_dp_rank=%d local_dp_rank=%d",
+                self.processes[-1].name,
+                global_index,
+                local_index,
+            )
 
         self._finalizer = weakref.finalize(self, shutdown, self.processes)
         self.manager_stopped = threading.Event()
@@ -232,7 +238,17 @@ class CoreEngineProcManager:
                     dp_local_rank=local_dp_rank,
                     process_kind="EngineCore",
                 ):
+                    logger.debug(
+                        "CoreEngineProcManager: starting process name=%s local_dp_rank=%d",
+                        proc.name,
+                        local_dp_rank,
+                    )
                     proc.start()
+                    logger.debug(
+                        "CoreEngineProcManager: started process name=%s pid=%s",
+                        proc.name,
+                        proc.pid,
+                    )
         finally:
             # Kill other procs if not all are running.
             if self.finished_procs():

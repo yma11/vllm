@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 
-import deep_ep
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
@@ -13,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import import_deep_ep
 from vllm.utils.math_utils import round_up
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
@@ -24,6 +26,13 @@ from vllm.v1.worker.ubatching import (
     dbo_yield_and_switch_from_comm_to_compute,
     dbo_yield_and_switch_from_compute_to_comm,
 )
+
+deep_ep = import_deep_ep()
+logger = init_logger(__name__)
+
+
+def _has_overlap_event(event) -> bool:
+    return getattr(event, "event", None) is not None
 
 
 class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -94,11 +103,15 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         return torch.int64
 
     def _get_dispatch_config(self) -> deep_ep.Config | None:
+        if current_platform.is_xpu():
+            return deep_ep.Config(8, 128, 256)
         if self.num_dispatchers_ not in self.available_rank_configs:
             return None
         return deep_ep.Buffer.get_dispatch_config(self.num_dispatchers_)
 
     def _get_combine_config(self) -> deep_ep.Config | None:
+        if current_platform.is_xpu():
+            return deep_ep.Config(8, 128, 256)
         if self.num_dispatchers_ not in self.available_rank_configs:
             return None
         return deep_ep.Buffer.get_combine_config(self.num_dispatchers_)
@@ -115,6 +128,14 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         defer_input_quant: bool,
     ) -> Callable:
         has_scales = token_scales is not None
+
+        if os.getenv("VLLM_DEEPEP_LOG_DISPATCH_TOKENS") == "1":
+            logger.info(
+                "DeepEP dispatch tokens: object=%#x local_tokens=%d topk=%d",
+                id(self),
+                tokens.shape[0],
+                rank_topk_ids.shape[1],
+            )
 
         # Capture a DeepEP event on the compute stream before yielding.
         # This must happen before the yield so the event only covers this
@@ -204,7 +225,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
     ) -> mk.PrepareResultType:
-        if event.event is not None:
+        if _has_overlap_event(event):
             event.current_stream_wait()
 
         if has_scales:
@@ -370,6 +391,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 topk_ids=topk_ids,
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
+
         previous_event = dbo_get_previous_event(self.buffer.capture)
         dbo_yield_and_switch_from_compute_to_comm()
         assert fused_expert_output.dtype == torch.bfloat16, (
@@ -387,13 +409,12 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         )
 
         self._sync_dbo_comm_if_needed()
-
         dbo_switch_to_compute()
 
         if do_async:
 
             def _receiver():
-                if event.event is not None:
+                if _has_overlap_event(event):
                     event.current_stream_wait()
                 dbo_switch_to_comm()
                 output.copy_(combined_x, non_blocking=True)

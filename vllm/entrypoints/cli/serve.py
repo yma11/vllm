@@ -274,6 +274,10 @@ def run_multi_api_server(args: argparse.Namespace):
 
     if num_api_servers > 1:
         setup_multiprocess_prometheus()
+        logger.debug(
+            "run_multi_api_server: multiprocess prometheus enabled for %d API servers",
+            num_api_servers,
+        )
 
     shutdown_requested = False
 
@@ -289,6 +293,11 @@ def run_multi_api_server(args: argparse.Namespace):
     signal.signal(signal.SIGINT, signal_handler)
 
     listen_address, sock = setup_server(args, reuse_port=num_api_servers > 1)
+    logger.debug(
+        "run_multi_api_server: setup_server done listen_address=%s reuse_port=%s",
+        listen_address,
+        num_api_servers > 1,
+    )
 
     engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
     engine_args._api_process_count = num_api_servers
@@ -296,6 +305,13 @@ def run_multi_api_server(args: argparse.Namespace):
 
     usage_context = UsageContext.OPENAI_API_SERVER
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+    logger.debug(
+        "run_multi_api_server: engine config created dp_size=%s tp_size=%s local_engines_only=%s backend=%s",
+        vllm_config.parallel_config.data_parallel_size,
+        vllm_config.parallel_config.tensor_parallel_size,
+        vllm_config.parallel_config.local_engines_only,
+        vllm_config.parallel_config.data_parallel_backend,
+    )
 
     if num_api_servers > 1 and envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING:
         raise ValueError(
@@ -325,6 +341,13 @@ def run_multi_api_server(args: argparse.Namespace):
         vllm_config,
         num_api_servers,
         defer_api_server_ports=not (rust_frontend_path or is_ray_dp),
+    )
+    logger.debug(
+        "run_multi_api_server: engine zmq addresses prepared inputs=%s outputs=%s coordinator_in=%s coordinator_out=%s",
+        addresses.inputs,
+        addresses.outputs,
+        addresses.coordinator_input,
+        addresses.coordinator_output,
     )
 
     with launch_core_engines(
@@ -368,6 +391,11 @@ def run_multi_api_server(args: argparse.Namespace):
                 stats_update_address=stats_update_address,
                 tensor_queue=engine_launch.tensor_queue,
             )
+            logger.debug(
+                "run_multi_api_server: APIServerProcessManager created num_servers=%d stats_update_address=%s",
+                num_api_servers,
+                stats_update_address,
+            )
 
             if not is_ray_dp:
                 # Forward each child's bound endpoints to the engine handshake
@@ -375,6 +403,11 @@ def run_multi_api_server(args: argparse.Namespace):
                 # are pre-allocated above and Ray actors already hold them.
                 actual_inputs, actual_outputs = (
                     api_server_manager.gather_actual_addresses()
+                )
+                logger.debug(
+                    "run_multi_api_server: gathered actual child addresses inputs=%s outputs=%s",
+                    actual_inputs,
+                    actual_outputs,
                 )
                 addresses.inputs = actual_inputs
                 addresses.outputs = actual_outputs
@@ -386,6 +419,7 @@ def run_multi_api_server(args: argparse.Namespace):
 
     # Wait for API servers.
     try:
+        logger.debug("run_multi_api_server: waiting for API server / engine completion")
         wait_for_completion_or_failure(
             api_server_manager=api_server_manager,
             engine_manager=local_engine_manager,

@@ -233,7 +233,19 @@ class APIServerProcessManager:
                 args=(listen_address, sock, args, client_config),
             )
             self.processes.append(proc)
+            logger.debug(
+                "APIServerProcessManager: starting %s listen_address=%s input_address=%s output_address=%s",
+                proc.name,
+                listen_address,
+                in_addr,
+                out_addr,
+            )
             proc.start()
+            logger.debug(
+                "APIServerProcessManager: started %s pid=%s",
+                proc.name,
+                proc.pid,
+            )
 
             # Drop parent's write end so reader sees EOF on child death.
             child_send.close()
