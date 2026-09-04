@@ -87,6 +87,7 @@ RUN apt-get update -y && \
     add-apt-repository -y ppa:kobuk-team/intel-graphics && \
     apt-get update -y && \
     apt-get install -y --no-install-recommends libhwloc15 libpciaccess0 libigsc1 intel-metrics-library && \
+    apt-get install -y ocl-icd-opencl-dev && \
     mkdir xpu-m && \
     cd xpu-m && \
     wget https://github.com/intel/xpumanager/releases/download/v2.1.0/xpu-smi_2.1.0+26.33.6468cec-1.24.04_amd64.deb && \
