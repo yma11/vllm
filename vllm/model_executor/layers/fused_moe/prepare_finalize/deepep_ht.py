@@ -28,6 +28,87 @@ from vllm.v1.worker.ubatching import (
 deep_ep = import_deep_ep()
 
 
+import os as _os
+
+
+def _deepep_dump_enabled() -> bool:
+    return _os.environ.get("VLLM_DEEPEP_DUMP", "0") == "1"
+
+
+_DEEPEP_DUMP_CALL_COUNT = 0
+_DEEPEP_DUMP_MAX_CALLS = int(_os.environ.get("VLLM_DEEPEP_DUMP_MAX", "2"))
+
+
+def _t_stats(name: str, t):
+    if t is None:
+        return f"{name}=None"
+    try:
+        info = (
+            f"{name}: shape={tuple(t.shape)} dtype={t.dtype} device={t.device} "
+            f"contig={t.is_contiguous()} numel={t.numel()}"
+        )
+        if t.numel() == 0:
+            return info + " EMPTY"
+        if t.dtype.is_floating_point:
+            with torch.no_grad():
+                f = t.detach().to(torch.float32)
+                nan = torch.isnan(f).any().item()
+                inf = torch.isinf(f).any().item()
+                mn = f.min().item()
+                mx = f.max().item()
+                mean = f.mean().item()
+            info += (
+                f" nan={nan} inf={inf} min={mn:.4g} max={mx:.4g} mean={mean:.4g}"
+            )
+        else:
+            with torch.no_grad():
+                mn = t.min().item()
+                mx = t.max().item()
+            info += f" min={mn} max={mx}"
+        return info
+    except Exception as e:  # noqa: BLE001
+        return f"{name}: <stats-error {e!r}>"
+
+
+def _deepep_dump_after_dispatch(
+    expert_x,
+    expert_x_scale,
+    expert_tokens_meta,
+    expert_topk_ids,
+    expert_topk_weights,
+):
+    global _DEEPEP_DUMP_CALL_COUNT
+    if _DEEPEP_DUMP_CALL_COUNT >= _DEEPEP_DUMP_MAX_CALLS:
+        return
+    _DEEPEP_DUMP_CALL_COUNT += 1
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    except Exception:
+        rank = -1
+    tag = f"[deepep-dump rank={rank} call#{_DEEPEP_DUMP_CALL_COUNT}]"
+    lines = [tag]
+    x = expert_x[0] if isinstance(expert_x, tuple) else expert_x
+    lines.append("  " + _t_stats("expert_x", x))
+    if isinstance(expert_x, tuple) and len(expert_x) > 1:
+        lines.append("  " + _t_stats("expert_x_dispatched_scale", expert_x[1]))
+    lines.append("  " + _t_stats("expert_x_scale", expert_x_scale))
+    lines.append("  " + _t_stats("expert_topk_ids", expert_topk_ids))
+    lines.append("  " + _t_stats("expert_topk_weights", expert_topk_weights))
+    if expert_tokens_meta is not None:
+        ent = getattr(expert_tokens_meta, "expert_num_tokens", None)
+        entc = getattr(expert_tokens_meta, "expert_num_tokens_cpu", None)
+        lines.append("  " + _t_stats("expert_num_tokens", ent))
+        lines.append("  " + _t_stats("expert_num_tokens_cpu", entc))
+        try:
+            total = int(ent.sum().item()) if ent is not None else -1
+        except Exception:
+            total = -1
+        lines.append(f"  sum(expert_num_tokens)={total}")
+        if x is not None and x.dim() >= 1:
+            lines.append(f"  x.shape[0] vs sum: {x.shape[0]} vs {total}")
+    print("\n".join(lines), flush=True)
+
+
 class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     """
     Prepare/Finalize using DeepEP High-Throughput kernels.
@@ -260,6 +341,15 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                     block_shape=quant_config.block_shape,
                     is_scale_swizzled=quant_config.is_scale_swizzled,
                 )
+
+        if _deepep_dump_enabled():
+            _deepep_dump_after_dispatch(
+                expert_x,
+                expert_x_scale,
+                expert_tokens_meta,
+                expert_topk_ids,
+                expert_topk_weights,
+            )
 
         return (
             expert_x,
