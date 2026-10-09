@@ -97,8 +97,8 @@ RUN apt-get update -y && \
     apt-get install -y ocl-icd-opencl-dev && \
     mkdir xpu-m && \
     cd xpu-m && \
-    wget https://github.com/intel/xpumanager/releases/download/v2.2.0/xpu-smi_2.2.0-1.24.04_amd64.deb && \
-    apt install -y ./xpu-smi_2.2.0-1.24.04_amd64.deb --install-suggests && \
+    wget https://github.com/intel/xpumanager/releases/download/v2.1.0/xpu-smi_2.1.0+26.33.6468cec-1.24.04_amd64.deb && \
+    apt install -y ./xpu-smi_2.1.0+26.33.6468cec-1.24.04_amd64.deb --install-suggests && \
     cd .. && \
     rm -rf xpu-m && \
     add-apt-repository --remove -y ppa:kobuk-team/intel-graphics && \
