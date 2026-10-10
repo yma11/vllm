@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
-from functools import partial
+from functools import cache, partial
 
 import numpy as np
 import torch
@@ -41,13 +41,43 @@ def async_copy_to_gpu(
     return out.copy_(pinned, non_blocking=True)
 
 
+@cache
+def _uva_requires_explicit_h2d() -> bool:
+    """Whether UVA views must be emulated with a real device tensor.
+
+    On XPU, the accelerator "view" of a pinned CPU tensor is host USM, which
+    Triton's XPU driver rejects ("doesn't reference XPU device memory"). There
+    we fall back to a real device buffer plus an explicit H2D copy.
+    """
+    from vllm.platforms import current_platform
+
+    return current_platform.is_xpu()
+
+
 class UvaBuffer:
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
         if not is_uva_available():
             raise RuntimeError("UVA is not available")
         self.cpu = torch.zeros(size, dtype=dtype, device="cpu", pin_memory=True)
         self.np = self.cpu.numpy()
-        self.uva = get_accelerator_view_from_cpu_tensor(self.cpu)
+        self.explicit_h2d = _uva_requires_explicit_h2d()
+        if self.explicit_h2d:
+            from vllm.platforms import current_platform
+
+            self.uva = torch.zeros(
+                size, dtype=dtype, device=current_platform.device_type
+            )
+        else:
+            self.uva = get_accelerator_view_from_cpu_tensor(self.cpu)
+
+    def flush(self, n: int | None = None) -> None:
+        """Push the CPU-side contents to the device, if needed."""
+        if not self.explicit_h2d:
+            return
+        if n is None:
+            self.uva.copy_(self.cpu, non_blocking=True)
+        else:
+            self.uva[:n].copy_(self.cpu[:n], non_blocking=True)
 
 
 class UvaBufferPool:
@@ -76,6 +106,7 @@ class UvaBufferPool:
         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
         n = len(x)
         dst[:n] = x
+        buf.flush(n)
         return buf.uva[:n]
 
     def copy_to_gpu(
