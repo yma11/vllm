@@ -149,7 +149,6 @@ dpcpp-cpp-rt==2026.0.0
     #   onemkl-sycl-lapack
     #   onemkl-sycl-rng
     #   onemkl-sycl-sparse
-    #   torch
 einops==0.8.2
     # via -r requirements/test/../common.txt
 email-validator==2.3.0
@@ -180,7 +179,6 @@ filelock==3.32.3
     #   datasets
     #   huggingface-hub
     #   modelscope
-    #   torch
 frozenlist==1.8.0
     # via
     #   aiohttp
@@ -190,7 +188,6 @@ fsspec==2026.6.0
     #   datasets
     #   evaluate
     #   huggingface-hub
-    #   torch
 googleapis-common-protos==1.75.1
     # via
     #   opentelemetry-exporter-otlp-proto-grpc
@@ -263,23 +260,19 @@ ijson==3.5.1
 impi-rt==2021.18.0
     # via
     #   oneccl
-    #   torch
 iniconfig==2.3.0
     # via pytest
 intel-cmplr-lib-rt==2026.0.0
     # via
     #   intel-sycl-rt
-    #   torch
 intel-cmplr-lib-ur==2026.0.0
     # via
     #   intel-openmp
     #   intel-sycl-rt
-    #   torch
 intel-cmplr-lic-rt==2026.0.0
     # via
     #   intel-opencl-rt
     #   intel-sycl-rt
-    #   torch
 intel-opencl-rt==2026.0.0
     # via
     #   dpcpp-cpp-rt
@@ -288,19 +281,15 @@ intel-opencl-rt==2026.0.0
     #   onemkl-sycl-lapack
     #   onemkl-sycl-rng
     #   onemkl-sycl-sparse
-    #   torch
 intel-openmp==2026.0.0
     # via
     #   dpcpp-cpp-rt
     #   mkl
-    #   torch
 intel-pti==0.17.0
-    # via torch
 intel-sycl-rt==2026.0.0
     # via
     #   dpcpp-cpp-rt
     #   oneccl
-    #   torch
 interegular==0.3.3
     # via lm-format-enforcer
 jinja2==3.1.6
@@ -308,7 +297,6 @@ jinja2==3.1.6
     #   -c requirements/xpu.txt
     #   fastapi
     #   lm-eval
-    #   torch
 jiter==0.16.0
     # via
     #   anthropic
@@ -395,7 +383,6 @@ mkl==2026.0.0
     #   onemkl-sycl-lapack
     #   onemkl-sycl-rng
     #   onemkl-sycl-sparse
-    #   torch
 model-hosting-container-standards==0.1.16
     # via
     #   -c requirements/common.txt
@@ -423,7 +410,6 @@ multiprocess==0.70.19
 narwhals==2.24.0
     # via scikit-learn
 networkx==3.6.1
-    # via torch
 ninja==1.13.0
     # via -r requirements/test/../common.txt
 nltk==3.10.3
@@ -458,32 +444,23 @@ numpy==2.3.5
     #   sentence-transformers
     #   soundfile
     #   soxr
-    #   torchvision
     #   transformers
     #   xgrammar
 oneccl==2022.0.0
     # via
     #   oneccl-devel
-    #   torch
 oneccl-devel==2022.0.0
-    # via torch
 onemkl-license==2026.0.0
     # via
     #   mkl
-    #   torch
 onemkl-sycl-blas==2026.0.0
     # via
     #   onemkl-sycl-lapack
     #   onemkl-sycl-sparse
-    #   torch
 onemkl-sycl-dft==2026.0.0
-    # via torch
 onemkl-sycl-lapack==2026.0.0
-    # via torch
 onemkl-sycl-rng==2026.0.0
-    # via torch
 onemkl-sycl-sparse==2026.0.0
-    # via torch
 openai==3.2.0
     # via
     #   -c requirements/common.txt
@@ -572,7 +549,6 @@ pillow==12.3.0
     # via
     #   -r requirements/test/../common.txt
     #   mistral-common
-    #   torchvision
 platformdirs==4.11.3
     # via
     #   jupyter-core
@@ -727,7 +703,6 @@ pyyaml==6.0.3
     #   transformers
     #   uvicorn
 pyzes==0.1.1
-    # via torch
 pyzmq==27.1.0
     # via
     #   -c requirements/common.txt
@@ -824,7 +799,6 @@ setuptools==80.10.2
     #   model-hosting-container-standards
     #   modelscope
     #   pytablewriter
-    #   torch
 shellingham==1.5.4
     # via typer
 simsimd==6.5.16
@@ -874,7 +848,6 @@ structlog==26.1.0
 supervisor==4.3.0
     # via model-hosting-container-standards
 sympy==1.14.0
-    # via torch
 tabledata==1.3.5
     # via pytablewriter
 tabulate==0.10.0
@@ -883,13 +856,11 @@ tbb==2023.0.0
     # via
     #   intel-opencl-rt
     #   mkl
-    #   torch
 tblib==3.2.2
     # via -r requirements/test/xpu.in
 tcmlib==1.5.0
     # via
     #   tbb
-    #   torch
     #   umf
 tcolorpy==0.1.7
     # via pytablewriter
@@ -916,7 +887,6 @@ tokenizers==0.23.1
     #   -r requirements/test/../common.txt
     #   sentence-transformers
     #   transformers
-torch==2.13.0+xpu
     # via
     #   -c requirements/xpu.txt
     #   accelerate
@@ -924,9 +894,7 @@ torch==2.13.0+xpu
     #   mteb
     #   sentence-transformers
     #   timm
-    #   torchvision
     #   xgrammar
-torchvision==0.28.0+xpu
     # via timm
 tornado==6.5.8
     # via jupyter-client
@@ -963,7 +931,6 @@ triton==3.7.2+xpu
     #   xgrammar
 triton-xpu==3.7.2
     # via
-    #   torch
     #   triton
 truststore==0.10.4
     # via
@@ -1016,7 +983,6 @@ typing-extensions==4.16.0
     #   sentence-transformers
     #   soundfile
     #   starlette
-    #   torch
     #   typing-inspection
     #   xgrammar
 typing-inspection==0.4.4
@@ -1028,7 +994,6 @@ typing-inspection==0.4.4
 umf==1.1.0
     # via
     #   intel-cmplr-lib-ur
-    #   torch
 urllib3==2.7.0
     # via
     #   blobfile

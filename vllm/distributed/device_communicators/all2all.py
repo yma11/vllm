@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -218,27 +219,18 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
         if not current_platform.is_xpu():
             return buffer_kwargs
 
-        if self.internode:
-            raise RuntimeError(
-                "deep_ep_xpu only supports intranode expert parallel communication. "
-                "The current EP group spans multiple nodes."
-            )
-
         adapted_kwargs = dict(buffer_kwargs)
+        buffer_params = inspect.signature(deep_ep.Buffer.__init__).parameters
+        accepted_kwargs = set(buffer_params)
+        accepted_kwargs.discard("self")
 
-        # XPU DeepEP exposes an IPC-only constructor and does not accept the
-        # CUDA-specific buffer sizing and transport tuning kwargs.
-        adapted_kwargs["num_pcie_bytes"] = adapted_kwargs.pop("num_nvl_bytes", 0)
-        adapted_kwargs.pop("num_qps_per_rank", None)
-        adapted_kwargs.pop("allow_nvlink_for_low_latency_mode", None)
-        adapted_kwargs.pop("allow_mnnvl", None)
+        if "num_nvl_bytes" in adapted_kwargs and "num_pcie_bytes" in accepted_kwargs:
+            adapted_kwargs["num_pcie_bytes"] = adapted_kwargs.pop("num_nvl_bytes")
 
         if adapted_kwargs.get("low_latency_mode"):
-            raise NotImplementedError(
-                "deep_ep_xpu does not support the deepep_low_latency backend yet."
-            )
+            adapted_kwargs.pop("num_pcie_bytes", None)
 
-        return adapted_kwargs
+        return {k: v for k, v in adapted_kwargs.items() if k in accepted_kwargs}
 
 
 class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
@@ -339,11 +331,6 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         """
         deep_ep = import_deep_ep()
 
-        if current_platform.is_xpu():
-            raise NotImplementedError(
-                "deep_ep_xpu does not support the deepep_low_latency backend yet."
-            )
-
         # Defaults for internode and intranode are taken from DeepEP tests.
         num_nvl_bytes = envs.VLLM_DEEPEP_BUFFER_SIZE_MB * 1024 * 1024
         num_qps_per_rank = num_local_experts
@@ -379,7 +366,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
 
         buffer_kwargs = self._make_all2all_kwargs(**kwargs)
         buffer_kwargs = self._adapt_buffer_kwargs_for_platform(deep_ep, buffer_kwargs)
-        print("!!!!!DeepEP all2all args %s", buffer_kwargs)
+        logger.debug("DeepEP all2all args %s", buffer_kwargs)
         handle: deep_ep.Buffer = self.handle_cache.get_or_create(
             buffer_kwargs, deep_ep.Buffer
         )
