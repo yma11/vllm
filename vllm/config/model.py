@@ -288,6 +288,8 @@ class ModelConfig:
     (linear, moe) and ignore patterns; see `QuantizationConfigArgs`.
     Auto-populated from the matching online shorthand when `quantization` is
     one of the values in `ONLINE_QUANT_SHORTHAND_NAMES`."""
+    nvfp4_mxfp4_shorthand: bool = field(default=False, init=False)
+    """Whether an MXFP4 shorthand overlays a ModelOpt NVFP4 checkpoint."""
     allow_deprecated_quantization: bool = False
     """Whether to allow deprecated quantization methods."""
     enforce_eager: bool = False
@@ -1521,12 +1523,13 @@ class ModelConfig:
                     f"({self.quantization})."
                 )
 
-        # Keep the NVFP4 loader selected above, but preserve the requested
-        # MXFP4 conversion as an online overlay.
+        # Keep the checkpoint loader selected above, but preserve the requested
+        # MXFP4 conversion as an online overlay. For mixed-precision checkpoints
+        # only the dequantizable NVFP4-family layers are converted later.
         if (
             quant_cfg is not None
             and requested_quantization == "mxfp4"
-            and self.quantization == "modelopt_fp4"
+            and self.quantization in ("modelopt_fp4", "modelopt_mixed")
         ):
             online_args = resolve_quantization_config(
                 requested_quantization, self.quantization_config
@@ -1536,6 +1539,7 @@ class ModelConfig:
                 online_args = merge_quantization_config(
                     _ONLINE_SHORTHANDS[requested_quantization], online_args
                 )
+                self.nvfp4_mxfp4_shorthand = True
             self.quantization_config = online_args
 
         if self.quantization is not None:

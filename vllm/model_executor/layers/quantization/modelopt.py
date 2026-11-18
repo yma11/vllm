@@ -798,6 +798,9 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
     def get_name(self) -> QuantizationMethods:
         return "modelopt_fp4"
 
+    def applies_nvfp4_mxfp4_shorthand(self, prefix: str, *, is_lm_head: bool) -> bool:
+        return not is_lm_head or not self.is_layer_excluded(prefix)
+
     def get_checkpoint_weight_mapper(self) -> WeightsMapper:  # type: ignore[override]
         """Pair CSF scale streams, on top of the usual name mappings."""
         mapper = super().get_checkpoint_weight_mapper()
@@ -1920,6 +1923,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
     legacy `hf_quant_config.json`.
     """
 
+    requires_per_layer_platform_validation = True
+
     def __init__(
         self,
         kv_cache_quant_method: str | None,
@@ -1995,6 +2000,16 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
     def get_name(self) -> QuantizationMethods:
         return "modelopt_mixed"
+
+    def get_layer_quantization_name(self, prefix: str) -> str:
+        quant_algo = self._resolve_quant_algo(prefix)
+        if quant_algo == "MXFP8":
+            return "mxfp8"
+        if quant_algo in _BLOCK_FP8_MOE_ALGOS:
+            return "modelopt"
+        if quant_algo in LINEAR_ALGOS:
+            return LINEAR_ALGOS[quant_algo][0]
+        return self.get_name()
 
     def get_checkpoint_weight_mapper(self) -> WeightsMapper:  # type: ignore[override]
         """Pair CSF scale streams, on top of the usual name mappings."""
@@ -2217,6 +2232,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         return tuple(dict.fromkeys(candidates))
 
+    def applies_nvfp4_mxfp4_shorthand(self, prefix: str, *, is_lm_head: bool) -> bool:
+        return not self.is_layer_excluded(prefix) and self._resolve_quant_algo(
+            prefix
+        ) in ("NVFP4", "W4A16_NVFP4")
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
@@ -2229,6 +2249,33 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         # Excluded layers
         if self.is_layer_excluded(prefix):
+            quant_algo = self._resolve_quant_algo(prefix)
+            if isinstance(layer, ParallelLMHead) and quant_algo in (
+                "NVFP4",
+                "W4A16_NVFP4",
+            ):
+                from vllm.model_executor.layers.quantization.online.lm_head import (
+                    DenseDequantizedLMHeadMethod,
+                )
+                from vllm.model_executor.layers.quantization.online.requantization import (  # noqa: E501
+                    skip_checkpoint_backend_selection,
+                )
+
+                quant_config = (
+                    self.nvfp4_config
+                    if quant_algo == "NVFP4"
+                    else self.w4a16_nvfp4_config
+                )
+                with skip_checkpoint_backend_selection():
+                    source_method = quant_config.get_quant_method(layer, prefix)
+                if (
+                    source_method is None
+                    or not source_method.supports_online_requantization
+                ):
+                    raise NotImplementedError(
+                        f"{prefix}: cannot dequantize excluded {quant_algo} lm_head."
+                    )
+                return DenseDequantizedLMHeadMethod(source_method)
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
             return None
@@ -3173,6 +3220,10 @@ class ModelOptLinearMethod(LinearMethodBase):
                 refill_derived(layer, name, src.detach().clone())
             layer._nvfp4_group_size_for_gather = self.ctx.group_size
         self.kernel.process_weights_after_loading(layer)
+
+    @property
+    def supports_online_requantization(self) -> bool:
+        return self.wkey.key in (kMxfp8Static, kNvfp4Static)
 
     def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
         """Reconstruct serialized weights for online requantization."""

@@ -20,12 +20,16 @@ from vllm.model_executor.kernels.linear import (
     choose_mp_linear_kernel,
 )
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PtpcOnlineLinearMethod,
     OnlineLinearBase,
 )
 from vllm.model_executor.layers.quantization.online.nvfp4 import (
     Nvfp4WeightOnlyOnlineLinearMethod,
+)
+from vllm.model_executor.layers.quantization.online.requantization import (
+    OnlineRequantizationMixin,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -34,6 +38,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -209,6 +214,52 @@ class OnlineLMHeadMethodBase(OnlineLinearBase):
     ) -> torch.Tensor:
         assert self.kernel is not None
         return self.kernel.apply_weights(layer, x, bias)
+
+
+class DenseDequantizedLMHeadMethod(OnlineRequantizationMixin, UnquantizedLinearMethod):
+    """Serve a checkpoint-quantized lm_head as a dense fp16/bf16 head.
+
+    Some checkpoints store the head in a quantized format while excluding it
+    from quantized execution. The weights still need to be dequantized before
+    the dense GEMM.
+    """
+
+    def __init__(self, source_method: QuantizeMethodBase) -> None:
+        super().__init__()
+        self.set_requantization_source(source_method)
+
+    def create_weights(self, layer: Module, *weight_args, **extra_weight_attrs) -> None:
+        if not self.create_requantization_source_weights(
+            layer, *weight_args, **extra_weight_attrs
+        ):
+            raise ValueError(
+                "A dense lm_head fallback requires a checkpoint quant method."
+            )
+
+    def tie_weights(self, layer: Module, embed_tokens: Module) -> Module:
+        raise ValueError(
+            "A checkpoint-quantized lm_head cannot be tied to the input "
+            "embeddings after dequantizing to a dense head."
+        )
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        source = self.requantization_source
+        assert source is not None
+        weight = source.dequantize_weight(layer)
+        if not isinstance(weight, torch.Tensor):
+            raise TypeError("A dense lm_head requires a single weight tensor.")
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        replace_parameter(layer, "weight", weight)
+        self.release_requantization_source_weights(layer)
+        if current_platform.is_cpu():
+            from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
+
+            dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
+        else:
+            super().process_weights_after_loading(layer)
+        layer._already_called_process_weights_after_loading = True
 
 
 _LM_HEAD_METHODS: dict[str, type[OnlineLinearBase]] = {

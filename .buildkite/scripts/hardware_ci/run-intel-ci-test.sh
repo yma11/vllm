@@ -88,6 +88,7 @@ case "${test_suite}" in
     pytest -v -s quantization/test_auto_round.py
     pytest -v -s \
       quantization/test_online.py \
+      quantization/test_modelopt.py::test_modelopt_mixed_nvfp4_to_mxfp4_checkpoint \
       --deselect=tests/quantization/test_online.py::test_online_quantization_loads_real_weights \
       --deselect="tests/quantization/test_online.py::test_online_quantization[False-requantization_mxfp8_ptcp_fp8]"
     ;;

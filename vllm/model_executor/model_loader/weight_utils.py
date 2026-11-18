@@ -241,7 +241,8 @@ def get_quant_config(
         assert isinstance(online_args, QuantizationConfigArgs)
 
         checkpoint_config.online_quantization_config = OnlineQuantizationConfig(
-            online_args
+            online_args,
+            nvfp4_mxfp4_shorthand=model_config.nvfp4_mxfp4_shorthand,
         )
         return checkpoint_config
 

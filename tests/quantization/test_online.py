@@ -68,6 +68,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import (
     _CUSTOMIZED_METHOD_TO_QUANT_CONFIG,
     QUANTIZATION_METHODS,
@@ -91,6 +92,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8Config,
     ModelOptLinearMethod,
+    ModelOptMixedPrecisionConfig,
     ModelOptMxFp8Config,
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
@@ -111,6 +113,9 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
     _is_tp_sharded,
 )
 from vllm.model_executor.layers.quantization.online.int8 import Int8OnlineMoEMethod
+from vllm.model_executor.layers.quantization.online.lm_head import (
+    DenseDequantizedLMHeadMethod,
+)
 from vllm.model_executor.layers.quantization.online.mxfp4 import (
     Mxfp4OnlineLinearMethod,
     Mxfp4OnlineMoEMethod,
@@ -728,6 +733,35 @@ def _fully_quantized_modelopt_mxfp8_config() -> ModelOptMxFp8Config:
     )
 
 
+def _mixed_modelopt_config(
+    quantized_layers: dict[str, dict[str, Any]],
+    *,
+    exclude_modules: list[str] | None = None,
+) -> ModelOptMixedPrecisionConfig:
+    return ModelOptMixedPrecisionConfig(
+        kv_cache_quant_method=None,
+        exclude_modules=exclude_modules or [],
+        quantized_layers=quantized_layers,
+        fp8_config=_fully_quantized_modelopt_config(),
+        nvfp4_config=ModelOptNvFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo=None,
+            exclude_modules=[],
+        ),
+        w4a16_nvfp4_config=ModelOptNvFp4Config(
+            quant_method="W4A16_NVFP4",
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo=None,
+            exclude_modules=[],
+        ),
+        mxfp8_config=ModelOptMxFp8Config(
+            is_checkpoint_mxfp8_serialized=True,
+            kv_cache_quant_algo=None,
+            exclude_modules=[],
+        ),
+    )
+
+
 def _moe_only_compressed_tensors_config() -> CompressedTensorsConfig:
     return CompressedTensorsConfig(
         target_scheme_map={"RoutedExperts": {}},
@@ -752,6 +786,12 @@ def _write_minimal_llama_config(
     if quantization_config is not None:
         config["quantization_config"] = quantization_config
     (model_path / "config.json").write_text(json.dumps(config))
+
+
+@pytest.fixture
+def tiny_model_config(tmp_path):
+    _write_minimal_llama_config(tmp_path)
+    return ModelConfig(model=str(tmp_path), dtype="bfloat16")
 
 
 @pytest.mark.parametrize(
@@ -1176,6 +1216,197 @@ def test_weight_loading_requantization(
         )
     # Source loading must leave the online processing method attached.
     assert layer.quant_method is target
+
+
+@pytest.mark.skip_global_cleanup
+def test_mixed_precision_online_requantization_keeps_unsupported_layers(
+    default_vllm_config, tiny_model_config, dist_init
+) -> None:
+    """Only dequantizable checkpoint layers are requantized."""
+    default_vllm_config.model_config = tiny_model_config
+    config = _mixed_modelopt_config(
+        {
+            "model.layers.0.mlp.gate_proj": {"quant_algo": "NVFP4"},
+            "model.layers.0.mlp.down_proj": {"quant_algo": "FP8"},
+        }
+    )
+    config.online_quantization_config = OnlineQuantizationConfig(
+        quant_config_args(linear="mxfp4"), nvfp4_mxfp4_shorthand=True
+    )
+    kwargs = dict(
+        input_size=128,
+        output_size=64,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        disable_tp=True,
+    )
+
+    nvfp4_layer = ColumnParallelLinear(prefix="model.layers.0.mlp.gate_proj", **kwargs)
+    fp8_layer = ColumnParallelLinear(prefix="model.layers.0.mlp.down_proj", **kwargs)
+
+    assert isinstance(nvfp4_layer.quant_method, Mxfp4OnlineLinearMethod)
+    source = nvfp4_layer.quant_method.requantization_source
+    assert isinstance(source, ModelOptLinearMethod)
+    assert source.wkey.key is kNvfp4Static
+    assert source.supports_online_requantization
+    assert isinstance(fp8_layer.quant_method, ModelOptLinearMethod)
+    assert fp8_layer.quant_method.wkey.key is kFp8StaticTensorSym
+    assert not fp8_layer.quant_method.supports_online_requantization
+
+
+def _load_nvfp4_lm_head(layer: ParallelLMHead, global_scale: float = 2.0):
+    vocab, hidden = (
+        layer.num_embeddings_per_partition,
+        layer.input_size_per_partition,
+    )
+    checkpoint = {
+        "weight": torch.full((vocab, hidden // 2), 0x22, dtype=torch.uint8),
+        "weight_scale": torch.ones(vocab, hidden // 16, dtype=torch.float8_e4m3fn),
+        "weight_scale_2": torch.tensor([global_scale]),
+    }
+    for name, tensor in checkpoint.items():
+        param = getattr(layer, name)
+        param.weight_loader(param, tensor)
+    return torch.full((vocab, hidden), global_scale, dtype=torch.bfloat16)
+
+
+@pytest.mark.parametrize(
+    "online_config_args",
+    [
+        quant_config_args(linear="mxfp4"),
+        quant_config_args(targets={"lm_head": "mxfp4"}),
+    ],
+    ids=["linear-spec", "lm-head-target"],
+)
+@pytest.mark.skip_global_cleanup
+def test_nvfp4_lm_head_requantizes_to_mxfp4(
+    default_vllm_config, tiny_model_config, online_config_args, dist_init
+) -> None:
+    """A non-excluded NVFP4 lm_head is converted, not served densely."""
+    default_vllm_config.model_config = tiny_model_config
+    config = ModelOptNvFp4Config(is_checkpoint_nvfp4_serialized=True)
+    config.online_quantization_config = OnlineQuantizationConfig(
+        online_config_args,
+        nvfp4_mxfp4_shorthand=online_config_args.targets is None,
+    )
+
+    layer = ParallelLMHead(
+        64,
+        128,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="lm_head",
+        disable_tp=True,
+    )
+    assert isinstance(layer.quant_method, Mxfp4OnlineLinearMethod)
+    source = layer.quant_method.requantization_source
+    assert isinstance(source, ModelOptLinearMethod)
+    assert source.wkey.key is kNvfp4Static
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "fp8_per_tensor",
+        {"weight": "mxfp4", "activation": "fp8_per_tensor_static"},
+    ],
+)
+def test_invalid_lm_head_target_is_not_silently_downgraded(
+    default_vllm_config, target, dist_init
+) -> None:
+    config = ModelOptNvFp4Config(is_checkpoint_nvfp4_serialized=True)
+    config.online_quantization_config = OnlineQuantizationConfig(
+        quant_config_args(targets={"lm_head": target})
+    )
+
+    with pytest.raises(NotImplementedError):
+        ParallelLMHead(
+            64,
+            128,
+            params_dtype=torch.bfloat16,
+            quant_config=config,
+            prefix="lm_head",
+            disable_tp=True,
+        )
+
+
+@pytest.mark.skip_global_cleanup
+def test_mixed_precision_excluded_nvfp4_lm_head_uses_dense_fallback(
+    default_vllm_config, tiny_model_config, dist_init
+) -> None:
+    """An excluded but NVFP4-stored lm_head is dequantized, not loaded as BF16."""
+    default_vllm_config.model_config = tiny_model_config
+    config = _mixed_modelopt_config(
+        {"lm_head": {"quant_algo": "NVFP4"}},
+        exclude_modules=["lm_head"],
+    )
+
+    layer = ParallelLMHead(
+        64,
+        128,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="lm_head",
+        disable_tp=True,
+    )
+    assert isinstance(layer.quant_method, DenseDequantizedLMHeadMethod)
+    expected = _load_nvfp4_lm_head(layer)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    torch.testing.assert_close(layer.weight.cpu(), expected, rtol=0, atol=0)
+    assert not hasattr(layer, "weight_scale")
+    assert not hasattr(layer, "weight_scale_2")
+
+
+def test_dense_dequantized_lm_head_supports_fp32_logits(
+    tmp_path, default_vllm_config, dist_init
+) -> None:
+    _write_minimal_llama_config(tmp_path)
+    default_vllm_config.model_config = ModelConfig(
+        model=str(tmp_path), dtype="bfloat16", hf_overrides={"head_dtype": "float32"}
+    )
+    config = _mixed_modelopt_config(
+        {"lm_head": {"quant_algo": "NVFP4"}},
+        exclude_modules=["lm_head"],
+    )
+    layer = ParallelLMHead(
+        64,
+        128,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="lm_head",
+        disable_tp=True,
+    )
+    _load_nvfp4_lm_head(layer)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    logits = LogitsProcessor(64)(
+        layer, torch.ones((1, 128), dtype=torch.bfloat16), skip_gather=True
+    )
+    assert logits is not None
+    assert logits.dtype == torch.float32
+    torch.testing.assert_close(logits, torch.full((1, 64), 256.0), rtol=0, atol=0)
+
+
+def test_linear_online_config_does_not_select_native_fp8_lm_head(
+    default_vllm_config, dist_init
+) -> None:
+    config = _fully_quantized_modelopt_config()
+    config.online_quantization_config = OnlineQuantizationConfig(
+        quant_config_args(linear="fp8_per_channel")
+    )
+
+    layer = ParallelLMHead(
+        64,
+        128,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="lm_head",
+        disable_tp=True,
+    )
+    assert isinstance(layer.quant_method, ModelOptLinearMethod)
+    assert layer.quant_method.wkey.key is kFp8StaticTensorSym
 
 
 @pytest.mark.skip_global_cleanup
@@ -1838,6 +2069,217 @@ def test_online_shorthand_selects_checkpoint_or_online_config(
     else:
         assert isinstance(result, OnlineQuantizationConfig)
         assert result.online_quantization_config is None
+
+
+@pytest.mark.parametrize("quantization", [None, "mxfp4"])
+def test_online_shorthand_mixed_checkpoint_selects_online_config(
+    tmp_path, quantization
+) -> None:
+    """The mxfp4 shorthand overlays a ModelOpt mixed checkpoint."""
+    _write_minimal_llama_config(
+        tmp_path,
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.layers.0.mlp.gate_proj": {"quant_algo": "NVFP4"},
+                "model.layers.0.mlp.down_proj": {"quant_algo": "FP8"},
+            },
+        },
+    )
+    model_config = ModelConfig(model=str(tmp_path), quantization=quantization)
+
+    result = weight_utils.get_quant_config(model_config, LoadConfig())
+
+    assert isinstance(result, ModelOptMixedPrecisionConfig)
+    assert model_config.quantization == "modelopt_mixed"
+    if quantization == "mxfp4":
+        assert result.online_quantization_config is not None
+        assert result.online_quantization_config.args == quant_config_args(
+            linear="mxfp4", moe="mxfp4"
+        )
+    else:
+        assert result.online_quantization_config is None
+
+
+def test_mixed_mxfp4_shorthand_preserves_non_nvfp4_layers(
+    tmp_path, default_vllm_config, dist_init
+) -> None:
+    _write_minimal_llama_config(
+        tmp_path,
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "exclude_modules": ["model.excluded"],
+            "quantized_layers": {
+                "model.nvfp4": {"quant_algo": "NVFP4"},
+                "model.fp8": {"quant_algo": "FP8"},
+                "model.mxfp8": {"quant_algo": "MXFP8"},
+                "model.excluded": {"quant_algo": "NVFP4"},
+            },
+        },
+    )
+    model_config = ModelConfig(model=str(tmp_path), quantization="mxfp4")
+    default_vllm_config.model_config = model_config
+    config = weight_utils.get_quant_config(model_config, LoadConfig())
+
+    def layer(prefix: str) -> ReplicatedLinear:
+        return ReplicatedLinear(
+            128,
+            64,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=config,
+            prefix=prefix,
+        )
+
+    assert isinstance(layer("model.nvfp4").quant_method, Mxfp4OnlineLinearMethod)
+    fp8 = layer("model.fp8")
+    assert isinstance(fp8.quant_method, ModelOptLinearMethod)
+    assert fp8.quant_method.wkey.key is kFp8StaticTensorSym
+    mxfp8 = layer("model.mxfp8")
+    assert isinstance(mxfp8.quant_method, ModelOptLinearMethod)
+    assert mxfp8.quant_method.wkey.key is kMxfp8Static
+    assert isinstance(layer("model.dense").quant_method, UnquantizedLinearMethod)
+    assert isinstance(layer("model.excluded").quant_method, UnquantizedLinearMethod)
+
+
+@pytest.mark.parametrize("algorithm", ["NVFP4", "W4A16_NVFP4", "FP8", "MXFP8", None])
+def test_mixed_mxfp4_shorthand_selects_only_nvfp4_head(
+    tmp_path, default_vllm_config, dist_init, algorithm
+) -> None:
+    quantized_layers = {"model.other": {"quant_algo": "NVFP4"}}
+    if algorithm is not None:
+        quantized_layers["lm_head"] = {"quant_algo": algorithm}
+    _write_minimal_llama_config(
+        tmp_path,
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": quantized_layers,
+        },
+    )
+    model_config = ModelConfig(model=str(tmp_path), quantization="mxfp4")
+    default_vllm_config.model_config = model_config
+    config = weight_utils.get_quant_config(model_config, LoadConfig())
+    head = ParallelLMHead(
+        64,
+        128,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="lm_head",
+        disable_tp=True,
+    )
+    if algorithm in ("NVFP4", "W4A16_NVFP4"):
+        assert isinstance(head.quant_method, Mxfp4OnlineLinearMethod)
+        source = head.quant_method.requantization_source
+        assert isinstance(source, ModelOptLinearMethod)
+        assert source.wkey.key is kNvfp4Static
+    elif algorithm in ("FP8", "MXFP8"):
+        assert isinstance(head.quant_method, ModelOptLinearMethod)
+        assert head.quant_method.wkey.key is (
+            kFp8StaticTensorSym if algorithm == "FP8" else kMxfp8Static
+        )
+    else:
+        assert isinstance(head.quant_method, UnquantizedLinearMethod)
+
+
+@pytest.mark.parametrize("with_online_overlay", [False, True])
+def test_mixed_checkpoint_validates_each_native_format(
+    tmp_path, default_vllm_config, dist_init, with_online_overlay
+) -> None:
+    """Mixed is a container, not permission to run unsupported native weights."""
+    _write_minimal_llama_config(
+        tmp_path,
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "fp8": {"quant_algo": "FP8"},
+                "mxfp8": {"quant_algo": "MXFP8"},
+                "nvfp4": {"quant_algo": "NVFP4"},
+            },
+        },
+    )
+    online = (
+        quant_config_args(targets={"selected": "fp8_per_channel"})
+        if with_online_overlay
+        else None
+    )
+    model_config = ModelConfig(model=str(tmp_path), quantization_config=online)
+    default_vllm_config.model_config = model_config
+    config = weight_utils.get_quant_config(model_config, LoadConfig())
+    layer = ReplicatedLinear(128, 64, bias=False, params_dtype=torch.bfloat16)
+    assert isinstance(resolve_quant_method(config, layer, "fp8"), ModelOptLinearMethod)
+    assert isinstance(
+        resolve_quant_method(config, layer, "mxfp8"), ModelOptLinearMethod
+    )
+    assert isinstance(
+        resolve_quant_method(config, layer, "dense"), UnquantizedLinearMethod
+    )
+    supported = current_platform.supported_quantization
+    if supported and "modelopt_fp4" not in supported:
+        with pytest.raises(ValueError, match="modelopt_fp4.*not supported"):
+            resolve_quant_method(config, layer, "nvfp4")
+    else:
+        assert isinstance(
+            resolve_quant_method(config, layer, "nvfp4"), ModelOptLinearMethod
+        )
+
+
+def test_explicit_target_conflicting_with_excluded_nvfp4_head_raises(
+    default_vllm_config, tiny_model_config, dist_init
+) -> None:
+    default_vllm_config.model_config = tiny_model_config
+    config = _mixed_modelopt_config(
+        {"lm_head": {"quant_algo": "NVFP4"}}, exclude_modules=["lm_head"]
+    )
+    config.online_quantization_config = OnlineQuantizationConfig(
+        quant_config_args(targets={"lm_head": "mxfp4"})
+    )
+    with pytest.raises(NotImplementedError, match="excluded lm_head"):
+        ParallelLMHead(
+            64,
+            128,
+            params_dtype=torch.bfloat16,
+            quant_config=config,
+            prefix="lm_head",
+            disable_tp=True,
+        )
+
+
+def test_mixed_explicit_target_requantizes_mxfp8(
+    tmp_path, default_vllm_config, dist_init
+) -> None:
+    _write_minimal_llama_config(
+        tmp_path,
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {"model.proj": {"quant_algo": "MXFP8"}},
+        },
+    )
+    model_config = ModelConfig(
+        model=str(tmp_path),
+        quantization_config=quant_config_args(
+            targets={"model.proj": "fp8_per_channel"}
+        ),
+    )
+    default_vllm_config.model_config = model_config
+    config = weight_utils.get_quant_config(model_config, LoadConfig())
+    layer = ReplicatedLinear(
+        128,
+        64,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="model.proj",
+    )
+
+    assert isinstance(layer.quant_method, Fp8PtpcOnlineLinearMethod)
+    source = layer.quant_method.requantization_source
+    assert isinstance(source, ModelOptLinearMethod)
+    assert source.wkey.key is kMxfp8Static
 
 
 @pytest.mark.parametrize("quantization", [None, "mxfp4"])

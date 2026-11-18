@@ -198,11 +198,20 @@ Unconverted checkpoint-quantized layers require native support for their
 checkpoint format. NVFP4-to-MXFP4 conversion can reduce accuracy; validate it
 per model or consider MXFP8 for dense and attention linears.
 
+On ModelOpt `MIXED_PRECISION` checkpoints, the shorthand converts only the
+non-excluded NVFP4 and W4A16_NVFP4 layers; BF16, FP8 and MXFP8 layers keep
+their checkpoint methods. A non-excluded NVFP4 lm_head is converted with the
+other linears. An excluded lm_head declared as NVFP4 or W4A16_NVFP4 is
+dequantized to the model dtype and served densely. Explicit `targets` select
+layers independently of the shorthand's default mixed-precision selection.
+
 !!! info
 
     Re-quantization is available for both linear and MoE layers.
 
-    Checkpoint-exclusion policy is not enforced by online quantization/re-quantization. Only exclusion through `--quantization-config.targets`/`--quantization-config.ignore` is enforced. 
+    Checkpoint exclusions are not generally enforced for explicit online targets.
+    An explicitly targeted NVFP4 lm_head that requires the dense fallback is
+    rejected rather than silently ignoring the target.
 
 ### Online quantization on unquantized layers from partially-quantized checkpoints
 

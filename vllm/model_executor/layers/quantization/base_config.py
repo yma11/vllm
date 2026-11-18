@@ -106,6 +106,11 @@ class QuantizeMethodBase(ABC):
             "not supported. Please open an issue."
         )
 
+    @property
+    def supports_online_requantization(self) -> bool:
+        """Whether `dequantize_weight` can be used as a requantization source."""
+        return type(self).dequantize_weight is not QuantizeMethodBase.dequantize_weight
+
 
 def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> bool:
     """Not all quant methods have embedding implemented, so we need to check that
@@ -121,6 +126,7 @@ def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> 
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
+    requires_per_layer_platform_validation: bool = False
     _ignore_unexpected_suffixes = (
         ".q_scale",
         ".k_scale",
@@ -228,6 +234,14 @@ class QuantizationConfig(ABC):
         """
         raise NotImplementedError
 
+    def get_layer_quantization_name(self, prefix: str) -> str:
+        """Platform quantization name for a checkpoint layer."""
+        return self.get_name()
+
+    def applies_nvfp4_mxfp4_shorthand(self, prefix: str, *, is_lm_head: bool) -> bool:
+        """Whether the ModelOpt NVFP4-to-MXFP4 shorthand selects this layer."""
+        return not is_lm_head
+
     @staticmethod
     def get_cache_scale_mapper() -> "WeightsMapper":
         """Mapping from checkpoint KV-cache scale names to vLLM scale names.
@@ -323,6 +337,9 @@ def resolve_quant_method(
     )
     from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
     from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
+    from vllm.model_executor.layers.quantization.online.lm_head import (
+        DenseDequantizedLMHeadMethod,
+    )
     from vllm.model_executor.layers.quantization.online.moe_base import (
         OnlineMoEMethodBase,
     )
@@ -345,7 +362,20 @@ def resolve_quant_method(
 
     online_target = None
     target_spec = None
-    if online_config is not None and is_online_supported_layer:
+    is_lm_head = isinstance(layer, ParallelLMHead)
+    allow_linear_lm_head = False
+    use_online_config = online_config is not None and is_online_supported_layer
+    if (
+        online_config is not None
+        and use_online_config
+        and online_config.nvfp4_mxfp4_shorthand
+    ):
+        use_online_config = quant_config.applies_nvfp4_mxfp4_shorthand(
+            prefix, is_lm_head=is_lm_head
+        )
+
+    if use_online_config:
+        assert online_config is not None
         online_config.packed_modules_mapping = quant_config.packed_modules_mapping
         online_target = online_config.resolve_quant_method_cls(type(layer), prefix)
         if online_config.args.targets is not None:
@@ -353,6 +383,25 @@ def resolve_quant_method(
                 prefix, type(layer)
             )
             target_spec = target[3] if target is not None else None
+        # Only the NVFP4 -> MXFP4 shorthand implicitly includes the lm_head.
+        if (
+            is_lm_head
+            and online_config.nvfp4_mxfp4_shorthand
+            and online_target is None
+            and online_config.args.linear is not None
+        ):
+            from vllm.model_executor.layers.quantization.utils.quant_utils import (
+                kMxfp4Static,
+            )
+
+            linear_target = online_config.resolve_quant_method_cls(LinearBase, prefix)
+            if (
+                linear_target is not None
+                and linear_target[3].weight == kMxfp4Static
+                and getattr(linear_target[4], "supports_lm_head", False)
+            ):
+                online_target = linear_target
+                allow_linear_lm_head = True
 
     if online_target is not None:
         current_platform.verify_quantization("online")
@@ -361,21 +410,14 @@ def resolve_quant_method(
     # is either a dequantization source or discarded in favour of the online
     # method (all paths below return the online method or raise). It therefore
     # needs no kernel backend, which the oracles skip in this scope.
+    requantization_source = online_target is not None
     with (
-        (
-            skip_checkpoint_backend_selection()
-            if online_target is not None
-            else nullcontext()
-        ),
+        skip_checkpoint_backend_selection() if requantization_source else nullcontext(),
         layer_target_spec_scope(target_spec if online_target is None else None),
     ):
         # A `targets` spec without a weight key overrides the activation of the
         # checkpoint method.
         base_quant_method = quant_config.get_quant_method(layer, prefix)
-    if online_config is None:
-        # No online configuration: retain the checkpoint method.
-        return base_quant_method
-
     # KV-cache scale loading does not require the checkpoint's weight kernels.
     checkpoint_is_quantized = base_quant_method is not None and not isinstance(
         base_quant_method,
@@ -384,34 +426,43 @@ def resolve_quant_method(
             UnquantizedFusedMoEMethod,
             UnquantizedEmbeddingMethod,
             BaseKVCacheMethod,
+            DenseDequantizedLMHeadMethod,
         ),
     )
     if online_target is None:
         # Untargeted quantized layers still execute the native checkpoint method.
-        if checkpoint_is_quantized:
-            current_platform.verify_quantization(quant_config.get_name())
+        if checkpoint_is_quantized and (
+            online_config is not None
+            or quant_config.requires_per_layer_platform_validation
+        ):
+            current_platform.verify_quantization(
+                quant_config.get_layer_quantization_name(prefix)
+            )
         return base_quant_method
 
-    if isinstance(layer, ParallelLMHead):
-        if checkpoint_is_quantized:
-            # TODO: online re-quantization of a checkpoint-quantized lm_head,
-            # like the linear layers in #59062.
+    assert online_config is not None
+    if is_lm_head:
+        if isinstance(base_quant_method, DenseDequantizedLMHeadMethod):
             raise NotImplementedError(
-                f"{prefix} is already quantized in the checkpoint "
-                f"({type(base_quant_method).__name__}); online re-quantization "
-                "of the lm_head is not supported, remove it from "
-                "quantization_config.targets."
+                f"{prefix}: an online target conflicts with the checkpoint's "
+                "excluded lm_head, which requires dense execution."
             )
+        if checkpoint_is_quantized:
+            assert base_quant_method is not None
+            if not base_quant_method.supports_online_requantization:
+                raise NotImplementedError(
+                    f"{prefix} is quantized with "
+                    f"{type(base_quant_method).__name__}, which does not "
+                    "implement dequantize_weight; cannot requantize the lm_head."
+                )
         from vllm.config import get_current_vllm_config
 
         model_config = get_current_vllm_config().model_config
         if getattr(model_config, "convert_type", None) == "classify":
-            # The seq-cls adapters read `lm_head.weight` rows by token id.
             raise NotImplementedError(
                 f"{prefix}: online quantization of the lm_head is not "
                 "supported for models converted to sequence classification."
             )
-        return online_config.get_quant_method(layer, prefix)
 
     if checkpoint_is_quantized:
         if online_target[3].hadamard_size is not None:
@@ -420,7 +471,9 @@ def resolve_quant_method(
                 "(requantization) is not supported yet."
             )
 
-        online_quant_method = online_config.get_quant_method(layer, prefix)
+        online_quant_method = online_config.get_quant_method(
+            layer, prefix, allow_linear_lm_head=allow_linear_lm_head
+        )
 
         assert base_quant_method is not None and not isinstance(
             base_quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
@@ -433,4 +486,6 @@ def resolve_quant_method(
         return online_quant_method
 
     # Quantize an unquantized layer with the online method.
-    return online_config.get_quant_method(layer, prefix)
+    return online_config.get_quant_method(
+        layer, prefix, allow_linear_lm_head=allow_linear_lm_head
+    )

@@ -87,6 +87,9 @@ class Mxfp4OnlineLinearMethod(OnlineLinearBase, InputHadamardFusable):
 
     activation_quant_key: "QuantKey | None" = kMxfp4Dynamic
     accepts_activation_override = True
+    # Block-32 scales are per output row, so a padded, TP-sharded vocab needs
+    # no cross-rank amax reduction.
+    supports_lm_head = True
 
     def __init__(self, activation_quant_key: "QuantKey | None" = kMxfp4Dynamic):
         super().__init__()
@@ -135,8 +138,9 @@ class Mxfp4OnlineLinearMethod(OnlineLinearBase, InputHadamardFusable):
         replace_parameter(layer, "weight", weight_fp4.data)
         replace_parameter(layer, "weight_scale", weight_scale.data)
 
-        self.kernel.process_weights_after_loading(layer)
+        # Kernels must not interpret checkpoint-only scales as MXFP4 parameters.
         self.release_requantization_source_weights(layer)
+        self.kernel.process_weights_after_loading(layer)
 
         layer._already_called_process_weights_after_loading = True
 

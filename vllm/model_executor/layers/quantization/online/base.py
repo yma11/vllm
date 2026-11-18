@@ -222,6 +222,8 @@ class OnlineQuantizationConfig(QuantizationConfig):
     def __init__(
         self,
         args: QuantizationConfigArgs,
+        *,
+        nvfp4_mxfp4_shorthand: bool = False,
     ) -> None:
         super().__init__()
         if args.linear is None and args.moe is None and args.targets is None:
@@ -231,6 +233,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
                 "quantization_config.targets to be set."
             )
         self.args = args
+        self.nvfp4_mxfp4_shorthand = nvfp4_mxfp4_shorthand
         self.ignored_layers: list[str] = args.ignore
         self.quantized_layers: dict[str, tuple[str, str, str | None]] = {}
         self.online_quantization_time = 0.0
@@ -342,13 +345,20 @@ class OnlineQuantizationConfig(QuantizationConfig):
         return cls
 
     def resolve_quant_method_cls(
-        self, layer_cls: type[torch.nn.Module], prefix: str
+        self,
+        layer_cls: type[torch.nn.Module],
+        prefix: str,
+        *,
+        allow_linear_lm_head: bool = False,
     ) -> tuple[OnlineQuantizationSource, str, str | None, QuantSpec, type] | None:
         """Resolve quantization metadata and method class without instantiating it.
 
         Args:
             layer_cls: Type of layer for which to resolve online quantization.
             prefix: Fully qualified layer name.
+            allow_linear_lm_head: Also apply the linear spec to an lm_head when
+                the selected method supports it. Used for checkpoint-quantized
+                heads, which are not selected by the linear spec otherwise.
 
         Returns:
             A tuple of source, quantization key string, target pattern, spec
@@ -374,6 +384,14 @@ class OnlineQuantizationConfig(QuantizationConfig):
                 source = OnlineQuantizationSource.moe
                 quant_spec = self.args.moe
                 table = _ONLINE_MOE_METHODS
+            elif (
+                allow_linear_lm_head
+                and issubclass(layer_cls, ParallelLMHead)
+                and self.args.linear is not None
+            ):
+                source = OnlineQuantizationSource.linear
+                quant_spec = self.args.linear
+                table = _ONLINE_LINEAR_METHODS
             else:
                 return None
 
@@ -502,10 +520,16 @@ class OnlineQuantizationConfig(QuantizationConfig):
         )
 
     def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
+        *,
+        allow_linear_lm_head: bool = False,
     ) -> "QuantizeMethodBase | None":
         # `targets` takes precedence over `moe` and `linear` and is exclusive.
-        resolved = self.resolve_quant_method_cls(type(layer), prefix)
+        resolved = self.resolve_quant_method_cls(
+            type(layer), prefix, allow_linear_lm_head=allow_linear_lm_head
+        )
         if resolved is not None:
             source, quant_key_str, target_pattern, quant_spec, quant_method_cls = (
                 resolved

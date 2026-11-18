@@ -889,6 +889,112 @@ def _pack_fp8_weight(weights: dict[str, torch.Tensor], name: str, algorithm: str
         weights[f"{name}.input_scale"] = torch.tensor(1.0 / 448)
 
 
+@pytest.mark.skipif(
+    not (current_platform.is_cuda() or current_platform.is_xpu()),
+    reason="This test covers the CUDA and XPU MXFP4/FP8 kernel paths.",
+)
+def test_modelopt_mixed_nvfp4_to_mxfp4_checkpoint(tmp_path, vllm_runner):
+    """Converted weights and retained FP8 match a dequantized reference."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from tests.models.utils import check_logprobs_close
+    from vllm import SamplingParams
+    from vllm.model_executor.layers.quantization.online.mxfp4 import (
+        Mxfp4OnlineLinearMethod,
+    )
+
+    config = LlamaConfig(num_hidden_layers=1, **_TINY_MODEL_CONFIG)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        model = LlamaForCausalLM(config).to(torch.bfloat16)
+    weights = dict(model.state_dict())
+    reference = dict(weights)
+    nvfp4 = ("model.layers.0.mlp.gate_proj", "model.layers.0.mlp.up_proj")
+    fp8 = "model.layers.0.self_attn.o_proj"
+    global_scale = 1.0 / 128
+    for name in nvfp4:
+        rows, cols = weights[f"{name}.weight"].shape
+        reference[f"{name}.weight"] = torch.full(
+            (rows, cols), global_scale, dtype=torch.bfloat16
+        )
+        weights[f"{name}.weight"] = torch.full(
+            (rows, cols // 2), 0x22, dtype=torch.uint8
+        )
+        weights[f"{name}.weight_scale"] = torch.ones(
+            (rows, cols // 16), dtype=torch.float8_e4m3fn
+        )
+        weights[f"{name}.weight_scale_2"] = torch.tensor([global_scale])
+        weights[f"{name}.input_scale"] = torch.tensor([1.0])
+    _pack_fp8_weight(weights, fp8, "FP8")
+    for suffix in ("weight", "weight_scale", "input_scale"):
+        reference[f"{fp8}.{suffix}"] = weights[f"{fp8}.{suffix}"]
+
+    def check_model(loaded_model):
+        layer = loaded_model.model.layers[0]
+        assert isinstance(layer.mlp.gate_up_proj.quant_method, Mxfp4OnlineLinearMethod)
+        assert isinstance(layer.self_attn.o_proj.quant_method, ModelOptLinearMethod)
+        assert layer.self_attn.o_proj.quant_method.wkey.key == kFp8StaticTensorSym
+        assert isinstance(loaded_model.lm_head.quant_method, UnquantizedLinearMethod)
+
+    prompt = [1, 2, 3, 5, 11, 17, 29, 41, 53, 67, 79, 97]
+    params = SamplingParams(
+        temperature=0, max_tokens=4, ignore_eos=True, logprobs=5, prompt_logprobs=0
+    )
+    outputs = []
+    prompt_logprobs = []
+    for name, state_dict, converted in (
+        ("mixed", weights, True),
+        ("reference", reference, False),
+    ):
+        layers = {fp8: {"quant_algo": "FP8"}}
+        if converted:
+            layers.update({layer: {"quant_algo": "NVFP4"} for layer in nvfp4})
+        model.config.quantization_config = {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": layers,
+        }
+        model_path = tmp_path / name
+        model.save_pretrained(model_path, state_dict=state_dict)
+        with vllm_runner(
+            str(model_path),
+            quantization="mxfp4" if converted else None,
+            dtype="bfloat16",
+            skip_tokenizer_init=True,
+            enforce_eager=True,
+            attention_backend="TRITON_ATTN" if current_platform.is_xpu() else None,
+            enable_flashinfer_autotune=False,
+            max_model_len=32,
+            max_num_batched_tokens=32,
+            max_num_seqs=1,
+            gpu_memory_utilization=0.02,
+            kv_cache_memory_bytes=16 << 20,
+        ) as llm:
+            if converted:
+                llm.apply_model(check_model)
+            output = llm.llm.generate([{"prompt_token_ids": prompt}], params)[0]
+        assert output.prompt_logprobs is not None
+        prompt_logprobs.append(
+            torch.tensor(
+                [
+                    position[token].logprob
+                    for position, token in zip(output.prompt_logprobs[1:], prompt[1:])
+                ]
+            )
+        )
+        sample = output.outputs[0]
+        outputs.append((list(sample.token_ids), sample.text, sample.logprobs))
+    torch.testing.assert_close(
+        prompt_logprobs[0], prompt_logprobs[1], rtol=0, atol=0.02
+    )
+    check_logprobs_close(
+        outputs_0_lst=[outputs[0]],
+        outputs_1_lst=[outputs[1]],
+        name_0="mixed",
+        name_1="dequantized reference",
+    )
+
+
 def _pack_int8_pb_wo_weight(
     weights: dict[str, torch.Tensor],
     reference: dict[str, torch.Tensor],
